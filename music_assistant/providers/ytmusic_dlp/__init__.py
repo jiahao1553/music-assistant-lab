@@ -20,7 +20,9 @@ from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
+    EventType,
     ImageType,
+    MediaType,
     ProviderFeature,
     StreamType,
 )
@@ -35,10 +37,8 @@ from music_assistant_models.media_items import (
     AudioFormat,
     ItemMapping,
     MediaItemImage,
-    MediaType,
     Playlist,
     ProviderMapping,
-    RecommendationFolder,
     SearchResults,
     Track,
     UniqueList,
@@ -51,21 +51,22 @@ from music_assistant.helpers.util import install_package, parse_title_and_versio
 from music_assistant.models.music_provider import MusicProvider
 
 from .helpers import (
-    YTM_FEATURED_PLAYLISTS,
-    determine_recommendation_icon,
     get_artist_albums,
     get_artist_info,
     get_artist_top_tracks,
     get_playlist_info,
-    get_recommendations,
     get_song_radio,
+    get_track_info,
     search_channels,
     search_playlists,
     search_ytmusic,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.event import MassEvent
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant import MusicAssistant
@@ -80,11 +81,9 @@ SUPPORTED_FEATURES = {
     ProviderFeature.SEARCH,
     ProviderFeature.BROWSE,
     ProviderFeature.LIBRARY_TRACKS,
-    ProviderFeature.LIBRARY_PLAYLISTS,
     ProviderFeature.ARTIST_ALBUMS,
     ProviderFeature.ARTIST_TOPTRACKS,
     ProviderFeature.SIMILAR_TRACKS,
-    ProviderFeature.RECOMMENDATIONS,
 }
 
 
@@ -151,6 +150,7 @@ class YoutubeMusicDlpProvider(MusicProvider):
     _cache_dir: Path
     _pre_download_count: int
     _in_progress: set[str]
+    _unsub_callbacks: list[Callable[[], None]]
 
     async def handle_async_init(self) -> None:
         """Set up the provider."""
@@ -161,9 +161,36 @@ class YoutubeMusicDlpProvider(MusicProvider):
         except ImportError as err:
             raise SetupFailedError("Package yt_dlp failed to install") from err
         self._cache_dir = Path(str(self.config.get_value(CONF_CACHE_DIR) or DEFAULT_CACHE_DIR))
-        self._pre_download_count = int(self.config.get_value(CONF_PRE_DOWNLOAD_COUNT) or 2)
+        self._pre_download_count = int(self.config.get_value(CONF_PRE_DOWNLOAD_COUNT) or 2)  # type: ignore[arg-type]
         self._in_progress = set()
+        self._unsub_callbacks = []
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._unsub_callbacks.append(
+            self.mass.subscribe(self._on_queue_updated, EventType.QUEUE_UPDATED)
+        )
+
+    async def unload(self, is_removed: bool = False) -> None:
+        """Handle unload of the provider."""
+        for unsub in self._unsub_callbacks:
+            unsub()
+        self._unsub_callbacks.clear()
+
+    async def _on_queue_updated(self, event: MassEvent) -> None:
+        """Start downloading the current track as soon as the queue index changes."""
+        from music_assistant_models.player_queue import PlayerQueue  # noqa: PLC0415
+
+        queue = event.data
+        if not isinstance(queue, PlayerQueue) or not queue.current_item:
+            return
+        media_item = queue.current_item.media_item
+        if not media_item:
+            return
+        video_id = next(
+            (m.item_id for m in media_item.provider_mappings if m.provider_domain == self.domain),
+            None,
+        )
+        if video_id and not self._find_cached_file(video_id):
+            self.mass.create_task(self._ensure_downloaded(video_id))
 
     @use_cache(3600 * 24 * 7)
     async def search(
@@ -184,7 +211,7 @@ class YoutubeMusicDlpProvider(MusicProvider):
         want_playlists = MediaType.PLAYLIST in active_types or MediaType.ALBUM in active_types
         want_artists = MediaType.ARTIST in active_types
 
-        async def _empty() -> list:
+        async def _empty() -> list[dict[str, Any]]:
             return []
 
         track_entries, playlist_entries, channel_entries = await asyncio.gather(
@@ -199,35 +226,75 @@ class YoutubeMusicDlpProvider(MusicProvider):
             else _empty(),
         )
 
+        tracks: list[Track | ItemMapping] = []
         for entry in track_entries:
             with suppress(InvalidDataError, KeyError, TypeError):
                 if track := self._parse_track_from_entry(entry):
-                    results.tracks.append(track)
+                    tracks.append(track)
+        results.tracks = tracks
 
+        playlists: list[Playlist | ItemMapping] = []
         for entry in playlist_entries:
             with suppress(InvalidDataError, KeyError, TypeError):
-                results.playlists.append(self._parse_playlist_from_entry(entry))
+                playlists.append(self._parse_playlist_from_entry(entry))
+        results.playlists = playlists
 
+        artists: list[Artist | ItemMapping] = []
         for entry in channel_entries:
             with suppress(InvalidDataError, KeyError, TypeError):
-                results.artists.append(self._parse_artist_from_entry(entry))
+                artists.append(self._parse_artist_from_entry(entry))
+        results.artists = artists
 
         return results
 
     @use_cache(3600 * 24 * 7)
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
-        from .helpers import get_track_info
-
         info = await get_track_info(prov_track_id, self.logger.level)
-        if not info:
-            msg = f"Track {prov_track_id} not found"
-            raise MediaNotFoundError(msg)
-        track = self._parse_track_from_entry(info)
-        if not track:
-            msg = f"Track {prov_track_id} could not be parsed"
-            raise MediaNotFoundError(msg)
-        return track
+        if info:
+            track = self._parse_track_from_entry(info)
+            if track:
+                return track
+
+        # yt-dlp info extraction failed (rate limit, sign-in required, etc.).
+        # If we have a cached file for this track, build a Track from its ID3 tags
+        # so that the track remains playable even when the network call fails.
+        if local_path := self._find_cached_file(prov_track_id):
+            with suppress(Exception):
+                tags = await async_parse_tags(str(local_path), local_path.stat().st_size)
+                name, version = parse_title_and_version(tags.title or prov_track_id)
+                track = Track(
+                    item_id=prov_track_id,
+                    provider=self.instance_id,
+                    name=name,
+                    version=version,
+                    duration=int(tags.duration or 0),
+                    provider_mappings={
+                        ProviderMapping(
+                            item_id=prov_track_id,
+                            provider_domain=self.domain,
+                            provider_instance=self.instance_id,
+                            url=f"{YTM_DOMAIN}/watch?v={prov_track_id}",
+                            audio_format=AudioFormat(content_type=ContentType.MP3),
+                        )
+                    },
+                )
+                if tags.artists:
+                    track.artists = UniqueList(
+                        [
+                            ItemMapping(
+                                media_type=MediaType.ARTIST,
+                                item_id=tags.artists[0],
+                                provider=self.instance_id,
+                                name=tags.artists[0],
+                            )
+                        ]
+                    )
+                self.logger.debug("Falling back to cached file tags for track %s", prov_track_id)
+                return track
+
+        msg = f"Track {prov_track_id} not found"
+        raise MediaNotFoundError(msg)
 
     @use_cache(3600 * 24 * 30)
     async def get_artist(self, prov_artist_id: str) -> Artist:
@@ -305,7 +372,11 @@ class YoutubeMusicDlpProvider(MusicProvider):
         for fpath in tracks_dir.iterdir():
             if not fpath.is_file() or fpath.stat().st_size == 0:
                 continue
-            video_id = fpath.stem
+            # filename format: "Song Title [video_id].mp3"
+            stem = fpath.stem
+            video_id = (
+                stem[stem.rfind("[") + 1 : -1] if stem.endswith("]") and "[" in stem else stem
+            )
             with suppress(Exception):
                 tags = await async_parse_tags(str(fpath), fpath.stat().st_size)
                 name, version = parse_title_and_version(tags.title or video_id)
@@ -326,109 +397,93 @@ class YoutubeMusicDlpProvider(MusicProvider):
                     },
                 )
                 if tags.artists:
-                    track.artists = [
-                        ItemMapping(
-                            media_type=MediaType.ARTIST,
-                            item_id=tags.artists[0],
-                            provider=self.instance_id,
-                            name=tags.artists[0],
-                        )
-                    ]
-                yield track
-
-    async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
-        """Yield featured YouTube Music playlists as the provider's playlist library."""
-        for name, playlist_id in YTM_FEATURED_PLAYLISTS.items():
-            yield Playlist(
-                item_id=playlist_id,
-                name=name,
-                provider=self.instance_id,
-                provider_mappings={
-                    ProviderMapping(
-                        item_id=playlist_id,
-                        provider_domain=self.domain,
-                        provider_instance=self.instance_id,
-                        url=f"{YTM_DOMAIN}/playlist?list={playlist_id}",
-                    )
-                },
-            )
-
-    @use_cache(3600)
-    async def recommendations(self) -> list[RecommendationFolder]:
-        """Get available recommendations."""
-        raw = await get_recommendations(self.logger.level)
-        folders = []
-        for item in raw:
-            folder = RecommendationFolder(
-                name=item["name"],
-                item_id=f"{self.instance_id}_{item['id']}",
-                provider=self.instance_id,
-                icon=determine_recommendation_icon(item["name"]),
-            )
-            # Populate folder with the playlist itself as a browse target
-            with suppress(InvalidDataError, KeyError, TypeError):
-                playlist = Playlist(
-                    item_id=item["id"],
-                    name=item["name"],
-                    provider=self.instance_id,
-                    provider_mappings={
-                        ProviderMapping(
-                            item_id=item["id"],
-                            provider_domain=self.domain,
-                            provider_instance=self.instance_id,
-                            url=f"{YTM_DOMAIN}/playlist?list={item['id']}",
-                        )
-                    },
-                )
-                if thumb_url := item.get("thumbnail"):
-                    playlist.metadata.images = UniqueList(
+                    track.artists = UniqueList(
                         [
-                            MediaItemImage(
-                                type=ImageType.THUMB,
-                                path=thumb_url,
+                            ItemMapping(
+                                media_type=MediaType.ARTIST,
+                                item_id=tags.artists[0],
                                 provider=self.instance_id,
-                                remotely_accessible=True,
+                                name=tags.artists[0],
                             )
                         ]
                     )
-                folder.items.append(playlist)
-            folders.append(folder)
-        return folders
+                yield track
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return the content details for the given track when it will be streamed."""
-        local_path = await self._ensure_downloaded(item_id)
         self.mass.create_task(self._pre_download_upcoming(item_id))
-        tags = await async_parse_tags(str(local_path), local_path.stat().st_size)
+
+        # If the file is fully cached, return LOCAL_FILE for full seek support.
+        # The streams controller calls get_stream_details BEFORE sending HTTP headers to
+        # the player, so we must return immediately when the file is not ready. We use
+        # CUSTOM in that case so the player receives 200 OK at once, and the actual
+        # download wait happens inside get_audio_stream (after headers are sent).
+        local_path = self._find_cached_file(item_id)
+        if local_path is not None and item_id not in self._in_progress:
+            tags = await async_parse_tags(str(local_path), local_path.stat().st_size)
+            return StreamDetails(
+                provider=self.instance_id,
+                item_id=item_id,
+                audio_format=AudioFormat(
+                    content_type=ContentType.try_parse(tags.format or "mp3"),
+                    sample_rate=tags.sample_rate,
+                    bit_depth=tags.bits_per_sample,
+                    channels=tags.channels,
+                    bit_rate=tags.bit_rate,
+                ),
+                media_type=MediaType.TRACK,
+                stream_type=StreamType.LOCAL_FILE,
+                duration=int(tags.duration or 0),
+                size=local_path.stat().st_size,
+                path=str(local_path),
+                can_seek=True,
+                allow_seek=True,
+            )
+
+        # File not ready yet — return immediately; download happens in get_audio_stream.
+        # Avoid any network call here: the streams controller calls get_stream_details
+        # BEFORE sending HTTP headers to the player, so blocking on get_track() would
+        # delay the 200 OK response and cause connection timeouts.
+        #
+        # Set expiration=0 so these CUSTOM streamdetails are immediately considered stale.
+        # When _load_item re-evaluates streamdetails (e.g. on next-press), it will call
+        # get_stream_details again, allowing the LOCAL_FILE path to be taken once the
+        # download completes. Without this, the 10-minute default expiration causes
+        # a cached file to still be streamed as CUSTOM (duration=0), breaking elapsed-time
+        # tracking and causing "seek to time-since-next-pressed" when user presses play.
         return StreamDetails(
             provider=self.instance_id,
             item_id=item_id,
-            audio_format=AudioFormat(
-                content_type=ContentType.try_parse(tags.format or "mp3"),
-                sample_rate=tags.sample_rate,
-                bit_depth=tags.bits_per_sample,
-                channels=tags.channels,
-                bit_rate=tags.bit_rate,
-            ),
+            audio_format=AudioFormat(content_type=ContentType.MP3),
             media_type=MediaType.TRACK,
-            stream_type=StreamType.LOCAL_FILE,
-            duration=tags.duration or 0,
-            size=local_path.stat().st_size,
-            path=str(local_path),
-            can_seek=True,
-            allow_seek=True,
+            stream_type=StreamType.CUSTOM,
+            duration=0,
+            can_seek=False,
+            allow_seek=False,
+            expiration=0,
         )
+
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream audio from cache, waiting for download to complete if necessary."""
+        import aiofiles  # noqa: PLC0415
+
+        local_path = await self._ensure_downloaded(streamdetails.item_id)
+        async with aiofiles.open(str(local_path), "rb") as f:
+            while chunk := await f.read(65536):
+                yield chunk
 
     async def _ensure_downloaded(self, video_id: str) -> Path:
         """Download a track if it is not already cached, then return its path."""
-        if cached := self._find_cached_file(video_id):
-            return cached
-
-        # Avoid parallel downloads of the same track
+        # Wait for any in-progress download to finish before checking the cache.
+        # yt-dlp writes the final file incrementally via ffmpeg, so _find_cached_file
+        # can return a partially-written file if we check before the download completes.
         while video_id in self._in_progress:
             await asyncio.sleep(0.5)
-            if cached := self._find_cached_file(video_id):
-                return cached
+
+        if cached := self._find_cached_file(video_id):
+            return cached
 
         self._in_progress.add(video_id)
         try:
@@ -443,11 +498,11 @@ class YoutubeMusicDlpProvider(MusicProvider):
 
     def _download_track(self, video_id: str) -> Path | None:
         """Run yt-dlp download synchronously (called in thread pool)."""
-        import yt_dlp
+        import yt_dlp  # noqa: PLC0415
 
         out_dir = self._cache_dir / "tracks"
         out_dir.mkdir(parents=True, exist_ok=True)
-        outtmpl = str(out_dir / f"{video_id}.%(ext)s")
+        outtmpl = str(out_dir / "%(title)s [%(id)s].%(ext)s")
 
         ydl_opts: dict[str, Any] = {
             "quiet": self.logger.level > logging.DEBUG,
@@ -460,7 +515,8 @@ class YoutubeMusicDlpProvider(MusicProvider):
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
-                }
+                },
+                {"key": "FFmpegMetadata", "add_metadata": True},
             ],
             "extractor_args": {
                 "youtube": {
@@ -487,7 +543,7 @@ class YoutubeMusicDlpProvider(MusicProvider):
         if not tracks_dir.is_dir():
             return None
         for fpath in tracks_dir.iterdir():
-            if fpath.stem == video_id and fpath.stat().st_size > 0:
+            if f"[{video_id}]" in fpath.stem and fpath.stat().st_size > 0:
                 return fpath
         return None
 
@@ -556,14 +612,16 @@ class YoutubeMusicDlpProvider(MusicProvider):
                 )
             },
         )
-        track.artists = [
-            ItemMapping(
-                media_type=MediaType.ARTIST,
-                item_id=channel_id,
-                provider=self.instance_id,
-                name=channel_name,
-            )
-        ]
+        track.artists = UniqueList(
+            [
+                ItemMapping(
+                    media_type=MediaType.ARTIST,
+                    item_id=channel_id,
+                    provider=self.instance_id,
+                    name=channel_name,
+                )
+            ]
+        )
         if not track.artists:
             msg = "Track is missing artists"
             raise InvalidDataError(msg)
@@ -713,9 +771,7 @@ class YoutubeMusicDlpProvider(MusicProvider):
             width = thumb.get("width", 0) or 0
             height = thumb.get("height", 0) or 0
             image_type = (
-                ImageType.LANDSCAPE
-                if height > 0 and width / height > 2.0
-                else ImageType.THUMB
+                ImageType.LANDSCAPE if height > 0 and width / height > 2.0 else ImageType.THUMB
             )
             result.append(
                 MediaItemImage(
