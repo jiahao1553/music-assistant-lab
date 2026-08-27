@@ -10,18 +10,13 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
 from aiohttp import ClientResponseError
-from music_assistant_models.config_entries import (
-    ConfigEntry,
-    ConfigValueType,
-    ProviderConfig,
-)
 from music_assistant_models.enums import (
-    ConfigEntryType,
     MediaType,
     ProviderFeature,
     StreamType,
 )
 from music_assistant_models.errors import (
+    InvalidDataError,
     LoginFailed,
     MediaNotFoundError,
     ProviderPermissionDenied,
@@ -29,7 +24,7 @@ from music_assistant_models.errors import (
 from music_assistant_models.media_items import (
     Album,
     Artist,
-    AudioFormat,
+    MediaItemType,
     Playlist,
     SearchResults,
     Track,
@@ -48,19 +43,24 @@ from music_assistant.providers.emby.const import (
     ITEM_KEY_COLLECTION_TYPE,
     ITEM_KEY_ID,
     ITEM_KEY_MEDIA_STREAMS,
+    ITEM_KEY_RUNTIME_TICKS,
     ITEM_LIMIT,
     ITEMS,
-    SUPPORTED_CONTAINER_FORMATS,
     TRACK_FIELDS,
 )
 from music_assistant.providers.emby.parsers import (
     parse_album,
     parse_artist,
     parse_playlist,
+    parse_stream_details,
     parse_track,
 )
 
 if TYPE_CHECKING:
+    from music_assistant_models.config_entries import (
+        ConfigEntry,
+        ProviderConfig,
+    )
     from music_assistant_models.provider import ProviderManifest
 
 from music_assistant.constants import (
@@ -90,47 +90,18 @@ async def setup(
     return EmbyProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,
-    action: str | None = None,
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    """Get configuration entries for provider setup."""
-    # ruff: noqa: ARG001
-    return (
-        ConfigEntry(
-            key=CONF_IP_ADDRESS,
-            type=ConfigEntryType.STRING,
-            label="Server",
-            required=True,
-            description="The url of the Emby server to connect to.",
-        ),
-        ConfigEntry(
-            key=CONF_USERNAME,
-            type=ConfigEntryType.STRING,
-            label="Username",
-            required=True,
-            description="The username to authenticate to the remote server.",
-        ),
-        ConfigEntry(
-            key=CONF_PASSWORD,
-            type=ConfigEntryType.SECURE_STRING,
-            label="Password",
-            required=False,
-            description="The password to authenticate to the remote server.",
-        ),
-    )
-
-
 class EmbyProvider(MusicProvider):
     """Provider for an Emby music library (uses Emby REST API)."""
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Get configuration entries for provider setup."""
+        return ()
+
     async def handle_async_init(self) -> None:
         """Initialize provider(instance) with given configuration."""
-        username = str(self.config.get_value(CONF_USERNAME))
-        password = str(self.config.get_value(CONF_PASSWORD) or "")
-        self._base_url = str(self.config.get_value(CONF_IP_ADDRESS)).rstrip("/") + "/"
+        username = str(self.get_setup_value(CONF_USERNAME))
+        password = str(self.get_setup_value(CONF_PASSWORD) or "")
+        self._base_url = str(self.get_setup_value(CONF_IP_ADDRESS)).rstrip("/") + "/"
         self._session = self.mass.http_session
 
         # stable device id
@@ -193,6 +164,20 @@ class EmbyProvider(MusicProvider):
             async with self._session.get(url, headers=self._headers, params=params) as resp:
                 resp.raise_for_status()
                 return await resp.json()  # type: ignore[no-any-return]
+        except ClientResponseError as err:
+            if err.status == 401:
+                raise LoginFailed("Unauthorized: invalid credentials") from err
+            if err.status == 403:
+                raise ProviderPermissionDenied("Forbidden: insufficient permissions") from err
+            if err.status == 404:
+                raise MediaNotFoundError(f"Item {path} not found") from err
+            raise
+
+    async def _post(self, path: str, json: dict[str, Any] | None = None) -> None:
+        url = urljoin(self._base_url, path.lstrip("/"))
+        try:
+            async with self._session.post(url, headers=self._headers, json=json) as resp:
+                resp.raise_for_status()
         except ClientResponseError as err:
             if err.status == 401:
                 raise LoginFailed("Unauthorized: invalid credentials") from err
@@ -267,7 +252,7 @@ class EmbyProvider(MusicProvider):
             search_results.playlists = playlists.result()
         return search_results
 
-    async def get_library_artists(self) -> AsyncGenerator[Artist, None]:
+    async def get_library_artists(self) -> AsyncGenerator[Artist]:
         """Yield all artists from the music library."""
         libs = await self._get_music_libraries()
         for lib in libs:
@@ -282,15 +267,30 @@ class EmbyProvider(MusicProvider):
             while True:
                 params["StartIndex"] = str(page * ITEM_LIMIT)
                 params["Limit"] = ITEM_LIMIT
-                resp = await self._get(f"Users/{self._user_id}/Items", params=params)
-                items = resp.get(ITEMS, [])
+                resp = await self._get("Artists", params=params)
+                items = self._get_response_items(resp, "artist")
                 if not items:
                     break
                 for artist in items:
+                    if not isinstance(artist, dict):
+                        self.report_skipped_sync_item(
+                            MediaType.ARTIST,
+                            None,
+                            InvalidDataError("Emby artist listing contains a non-object entry"),
+                        )
+                        continue
+                    item_id = artist.get(ITEM_KEY_ID)
+                    if not isinstance(item_id, str) or not item_id.strip():
+                        self.report_skipped_sync_item(
+                            MediaType.ARTIST,
+                            None,
+                            InvalidDataError("Emby artist listing entry has no id"),
+                        )
+                        continue
                     yield parse_artist(self.instance_id, self, artist)
                 page += 1
 
-    async def get_library_albums(self) -> AsyncGenerator[Album, None]:
+    async def get_library_albums(self) -> AsyncGenerator[Album]:
         """Yield all albums from the music library."""
         libs = await self._get_music_libraries()
         for lib in libs:
@@ -306,14 +306,29 @@ class EmbyProvider(MusicProvider):
                 params["StartIndex"] = str(page * ITEM_LIMIT)
                 params["Limit"] = ITEM_LIMIT
                 resp = await self._get(f"Users/{self._user_id}/Items", params=params)
-                items = resp.get(ITEMS, [])
+                items = self._get_response_items(resp, "album")
                 if not items:
                     break
                 for album in items:
+                    if not isinstance(album, dict):
+                        self.report_skipped_sync_item(
+                            MediaType.ALBUM,
+                            None,
+                            InvalidDataError("Emby album listing contains a non-object entry"),
+                        )
+                        continue
+                    item_id = album.get(ITEM_KEY_ID)
+                    if not isinstance(item_id, str) or not item_id.strip():
+                        self.report_skipped_sync_item(
+                            MediaType.ALBUM,
+                            None,
+                            InvalidDataError("Emby album listing entry has no id"),
+                        )
+                        continue
                     yield parse_album(self.instance_id, self, album)
                 page += 1
 
-    async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
+    async def get_library_tracks(self) -> AsyncGenerator[Track]:
         """Yield all tracks from the music library."""
         libs = await self._get_music_libraries()
         for lib in libs:
@@ -329,16 +344,37 @@ class EmbyProvider(MusicProvider):
                 params["StartIndex"] = str(page * ITEM_LIMIT)
                 params["Limit"] = ITEM_LIMIT
                 resp = await self._get(f"Users/{self._user_id}/Items", params=params)
-                items = resp.get(ITEMS, [])
+                items = self._get_response_items(resp, "track")
                 if not items:
                     break
                 for track in items:
-                    if not len(track.get(ITEM_KEY_MEDIA_STREAMS, [])):
+                    if not isinstance(track, dict):
+                        self.report_skipped_sync_item(
+                            MediaType.TRACK,
+                            None,
+                            InvalidDataError("Emby track listing contains a non-object entry"),
+                        )
+                        continue
+                    item_id = track.get(ITEM_KEY_ID)
+                    if not isinstance(item_id, str) or not item_id.strip():
+                        self.report_skipped_sync_item(
+                            MediaType.TRACK,
+                            None,
+                            InvalidDataError("Emby track listing entry has no id"),
+                        )
+                        continue
+                    media_streams = track.get(ITEM_KEY_MEDIA_STREAMS)
+                    if not isinstance(media_streams, list) or not media_streams:
+                        self.report_skipped_sync_item(
+                            MediaType.TRACK,
+                            item_id,
+                            InvalidDataError("Emby track has no media streams"),
+                        )
                         continue
                     yield parse_track(self.instance_id, self, track)
                 page += 1
 
-    async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
+    async def get_library_playlists(self) -> AsyncGenerator[Playlist]:
         """Yield all playlists from the music library."""
         libs = await self._get_music_libraries()
         for lib in libs:
@@ -353,10 +389,25 @@ class EmbyProvider(MusicProvider):
                 params["StartIndex"] = str(page * ITEM_LIMIT)
                 params["Limit"] = ITEM_LIMIT
                 resp = await self._get(f"Users/{self._user_id}/Items", params=params)
-                items = resp.get(ITEMS, [])
+                items = self._get_response_items(resp, "playlist")
                 if not items:
                     break
                 for playlist in items:
+                    if not isinstance(playlist, dict):
+                        self.report_skipped_sync_item(
+                            MediaType.PLAYLIST,
+                            None,
+                            InvalidDataError("Emby playlist listing contains a non-object entry"),
+                        )
+                        continue
+                    item_id = playlist.get(ITEM_KEY_ID)
+                    if not isinstance(item_id, str) or not item_id.strip():
+                        self.report_skipped_sync_item(
+                            MediaType.PLAYLIST,
+                            None,
+                            InvalidDataError("Emby playlist listing entry has no id"),
+                        )
+                        continue
                     yield parse_playlist(self.instance_id, self, playlist)
                 page += 1
 
@@ -469,18 +520,34 @@ class EmbyProvider(MusicProvider):
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get stream details for given item id and media type."""
-        track = await self.get_track(item_id)
-        # build universal audio URL (include token as query param for convenience)
-        container = ",".join(SUPPORTED_CONTAINER_FORMATS)
-        url = urljoin(self._base_url, f"Audio/{track.item_id}/universal")
-        params = {"Container": container, "api_key": self._token}
+        track_data = await self._get(
+            f"Users/{self._user_id}/Items/{item_id}",
+            params={"EnableUserData": "true", "Fields": ",".join(TRACK_FIELDS)},
+        )
+
+        audio_format = parse_stream_details(track_data)
+
+        url = urljoin(self._base_url, f"Audio/{item_id}/universal")
+        params = {
+            "Container": audio_format.content_type,
+            "AudioCodec": audio_format.codec_type,
+            "AudioSampleRate": audio_format.sample_rate,
+            "AudioChannels": audio_format.channels,
+            "Static": "true",
+            "api_key": self._token,
+        }
         query = "&".join([f"{k}={v}" for k, v in params.items()])
+
+        duration = int(
+            track_data.get(ITEM_KEY_RUNTIME_TICKS, 0) / 10000000
+        )  # Convert ticks to seconds
+
         return StreamDetails(
-            item_id=track.item_id,
+            item_id=item_id,
             provider=self.instance_id,
-            audio_format=AudioFormat(),
+            audio_format=audio_format,
             stream_type=StreamType.HTTP,
-            duration=int(track.duration) if getattr(track, "duration", None) else 0,
+            duration=duration,
             path=f"{url}?{query}",
             can_seek=True,
             allow_seek=True,
@@ -498,11 +565,43 @@ class EmbyProvider(MusicProvider):
 
     async def _get_music_libraries(self) -> list[dict[str, Any]]:
         resp = await self._get("Library/MediaFolders")
-        libs = resp.get(ITEMS, [])
+        libs = self._get_response_items(resp, "music library")
         result = []
         for library in libs:
+            if not isinstance(library, dict):
+                raise InvalidDataError("Emby music-library response contains a non-object entry")
             if ITEM_KEY_COLLECTION_TYPE in library:
                 collection_type = library.get(ITEM_KEY_COLLECTION_TYPE, "").lower()
                 if collection_type == "music":
                     result.append(library)
         return result
+
+    async def on_played(
+        self,
+        media_type: MediaType,
+        prov_item_id: str,
+        fully_played: bool,
+        position: int,
+        media_item: MediaItemType,
+        is_playing: bool = False,
+    ) -> None:
+        """Handle media item played event."""
+        if media_type != MediaType.TRACK:
+            return
+        if fully_played:
+            await self._post(f"Users/{self._user_id}/PlayedItems/{prov_item_id}")
+        if is_playing:
+            await self._post(
+                f"/Users/{self._user_id}/Items/{prov_item_id}/UserData",
+                json={"PlaybackPositionTicks": position * 10000000},
+            )
+        if not fully_played and position == 0:
+            await self._post(f"/Users/{self._user_id}/PlayedItems/{prov_item_id}/Delete")
+
+    @staticmethod
+    def _get_response_items(response: dict[str, Any], item_type: str) -> list[Any]:
+        """Return the required item list from an Emby listing response."""
+        items = response.get(ITEMS)
+        if not isinstance(items, list):
+            raise InvalidDataError(f"Emby {item_type} response contains no item list")
+        return items

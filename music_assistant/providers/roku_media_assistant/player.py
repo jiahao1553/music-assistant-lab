@@ -15,7 +15,7 @@ from music_assistant.models.player import Player, PlayerMedia
 from .constants import CONF_ROKU_APP_ID
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+    from music_assistant_models.config_entries import ConfigEntry
     from rokuecp import Roku
 
     from .provider import MediaAssistantprovider
@@ -65,13 +65,9 @@ class MediaAssistantPlayer(Player):
         """Return the interval in seconds to poll the player for state updates."""
         return 5 if self.powered else 30
 
-    async def get_config_entries(
-        self,
-        action: str | None = None,
-        values: dict[str, ConfigValueType] | None = None,
-    ) -> list[ConfigEntry]:
+    async def get_config_entries(self) -> list[ConfigEntry]:
         """Return all (provider/player specific) Config Entries for the player."""
-        default_entries = await super().get_config_entries(action=action, values=values)
+        default_entries = await super().get_config_entries()
         return [
             *default_entries,
             CONF_ENTRY_HTTP_PROFILE,
@@ -195,7 +191,7 @@ class MediaAssistantPlayer(Player):
                 ),
                 "albumArt": ("" if self.flow_mode else media.image_url or ""),
                 "songFormat": "flac",
-                "duration": media.duration or "",
+                "duration": media.stream_duration or media.duration or "",
                 "isLive": (
                     "true"
                     if media.media_type == MediaType.RADIO
@@ -226,6 +222,7 @@ class MediaAssistantPlayer(Player):
 
     async def enqueue_next_media(self, media: PlayerMedia) -> None:
         """Handle enqueuing of the next (queue) item on the player."""
+        stream_url = await self.provider.mass.streams.resolve_stream_url(self.player_id, media)
         try:
             device_info = await self.roku.update()
 
@@ -239,14 +236,14 @@ class MediaAssistantPlayer(Player):
             if app_running:
                 await self.roku_input(
                     {
-                        "u": media.uri,
+                        "u": stream_url,
                         "t": "a",
                         "albumName": media.album,
                         "songName": media.title,
                         "artistName": media.artist,
                         "albumArt": media.image_url,
                         "songFormat": "flac",
-                        "duration": media.duration,
+                        "duration": media.stream_duration or media.duration,
                         "enqueue": "true",
                     },
                 )

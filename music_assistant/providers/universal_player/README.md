@@ -8,7 +8,7 @@ The Universal Player provider creates virtual players that merge multiple protoc
 
 A Universal Player is automatically created by the PlayerController when:
 
-1. **Multiple protocol players are detected for the same device** - Based on MAC address or IP matching
+1. **One or more protocol players are detected for the same device** - Matching prefers MAC/serial/UUID-style identifiers and only falls back to IP as a last resort
 2. **No native player provider exists** - e.g., a Denon AVR with Chromecast, AirPlay, and DLNA but no native Denon integration
 
 ## Example Scenario
@@ -33,14 +33,18 @@ With the Universal Player provider, these are merged into a single:
 
 Protocol players are matched to the same device using:
 1. **MAC address** - Most reliable, extracted from device info
-2. **IP address** - Fallback when MAC is not available
+2. **Serial / UUID / protocol-specific IDs** - Used before any IP fallback
+3. **IP address** - Last resort when strong identifiers are missing or unreliable
+
+The controller will also try to validate or enrich reported MAC addresses with ARP before falling back to weaker matching.
 
 ### Player Creation Flow
 
 ```
-1. Chromecast player registers → No native parent, no other protocols → Stays as regular player
-2. AirPlay player registers → Matches Chromecast by MAC → PlayerController creates UniversalPlayer
-3. DLNA player registers → Matches existing UniversalPlayer → Added as linked protocol
+1. Chromecast player registers → No native parent → delayed evaluation is scheduled
+2. No native player appears → PlayerController creates a UniversalPlayer, even for this single unmatched protocol
+3. AirPlay player registers → Matches existing UniversalPlayer by identifiers → gets linked to it
+4. DLNA player registers → Matches existing UniversalPlayer → Added as linked protocol
 ```
 
 ### Feature Aggregation
@@ -64,20 +68,35 @@ Universal Players are auto-created and require no user configuration. However, u
 - Rename the player
 - Choose preferred output protocol
 - Disable/enable the player
+- Remove the universal player to wipe its config and restart protocol discovery from scratch
 
 ## Cleanup
 
-When all protocol players for a device are removed (e.g., provider unloaded), the Universal Player is automatically cleaned up.
+When a Universal Player is permanently removed, all protocol parent links are cleared so discovery can start over cleanly.
 
 If a native provider is later installed (e.g., Denon integration), the Universal Player is replaced by the native player, with all protocols linked to it instead.
 
 ## Technical Details
 
-### Player ID Format
+### Player ID
 
-Universal players use the format: `up{device_key}`
+Universal players use the format `up{random}`, minted once when the device is first
+wrapped. The id carries no device information and is never recomputed.
 
-Where `device_key` is typically the normalized MAC address.
+This matters because the player id is the identity API consumers (e.g. the Home
+Assistant integration) bind their entities to, so it has to stay stable for the
+lifetime of the device. A universal player is therefore always resolved through the
+`protocol_parent_id` that each of its protocol players persists, never by deriving an
+id from the identifiers that happen to be available at that moment. Deriving the id
+made it shift whenever a different set of protocol players was registered - from a
+MAC-based to a UUID-based id, for example - which orphaned the consumer's entity.
+
+As a consequence a universal player config is only ever deleted when the user removes
+the player, when a native player takes over the device, or when it is absorbed by
+another universal player of the same device in a merge. The latter two carry its
+settings over to the player that replaces it first. When the protocol players of a
+universal player merely disappear it becomes unavailable but keeps its config, because
+an opaque id cannot be recreated from the device.
 
 ### File Structure
 

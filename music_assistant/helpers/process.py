@@ -13,17 +13,23 @@ import logging
 import os
 
 # if TYPE_CHECKING:
-from collections.abc import AsyncGenerator
-from contextlib import suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 from signal import SIGINT
 from types import TracebackType
-from typing import Self
+from typing import Any, Self
 
 from music_assistant.constants import MASS_LOGGER_NAME, VERBOSE_LOG_LEVEL
 
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.helpers.process")
 
 DEFAULT_CHUNKSIZE = 64000
+
+# Ceiling on draining a pipe while closing. A child wedged in a read syscall never
+# closes its pipes, so an unbounded drain would keep close() from ever reaching the
+# terminate/SIGKILL escalation that actually reaps it.
+PIPE_DRAIN_TIMEOUT = 5
 
 
 def get_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
@@ -55,8 +61,10 @@ class AsyncProcess:
         stderr: bool | int | None = False,
         name: str | None = None,
         env: dict[str, str] | None = None,
+        pass_fds: tuple[int, ...] = (),
     ) -> None:
-        """Initialize AsyncProcess.
+        """
+        Initialize AsyncProcess.
 
         :param args: Command and arguments to execute.
         :param stdin: Stdin configuration (True for PIPE, False for None, or custom).
@@ -64,10 +72,12 @@ class AsyncProcess:
         :param stderr: Stderr configuration (True for PIPE, False for DEVNULL, or custom).
         :param name: Process name for logging.
         :param env: Environment variables for the subprocess (None inherits parent env).
+        :param pass_fds: Extra file descriptors kept open in the child (e.g. an
+            input pipe the command reads as ``pipe:<fd>``); the caller owns them.
         """
         self.proc: asyncio.subprocess.Process | None = None
         if name is None:
-            name = args[0].split(os.sep)[-1]
+            name = Path(args[0]).name
         self.name = name
         self.logger = LOGGER.getChild(name)
         self._args = args
@@ -75,6 +85,7 @@ class AsyncProcess:
         self._stdout = None if stdout is False else stdout
         self._stderr = asyncio.subprocess.DEVNULL if stderr is False else stderr
         self._env = get_subprocess_env(env)
+        self._pass_fds = pass_fds
         self._stderr_lock = asyncio.Lock()
         self._stdout_lock = asyncio.Lock()
         self._stdin_lock = asyncio.Lock()
@@ -122,12 +133,14 @@ class AsyncProcess:
             stdout=asyncio.subprocess.PIPE if self._stdout is True else self._stdout,
             stderr=asyncio.subprocess.PIPE if self._stderr is True else self._stderr,
             env=self._env,
+            bufsize=0,
+            pass_fds=self._pass_fds,
         )
         self.logger.log(
             VERBOSE_LOG_LEVEL, "Process %s started with PID %s", self.name, self.proc.pid
         )
 
-    async def iter_chunked(self, n: int = DEFAULT_CHUNKSIZE) -> AsyncGenerator[bytes, None]:
+    async def iter_chunked(self, n: int = DEFAULT_CHUNKSIZE) -> AsyncGenerator[bytes]:
         """Yield chunks of n size from the process stdout."""
         while True:
             chunk = await self.readexactly(n)
@@ -135,7 +148,7 @@ class AsyncProcess:
                 break
             yield chunk
 
-    async def iter_any(self, n: int = DEFAULT_CHUNKSIZE) -> AsyncGenerator[bytes, None]:
+    async def iter_any(self, n: int = DEFAULT_CHUNKSIZE) -> AsyncGenerator[bytes]:
         """Yield chunks as they come in from process stdout."""
         while True:
             chunk = await self.read(n)
@@ -156,7 +169,8 @@ class AsyncProcess:
                 return err.partial
 
     async def read(self, n: int) -> bytes:
-        """Read up to n bytes from the stdout stream.
+        """
+        Read up to n bytes from the stdout stream.
 
         If n is positive, this function try to read n bytes,
         and may return less or equal bytes than requested, but at least one byte.
@@ -171,21 +185,47 @@ class AsyncProcess:
 
     async def write(self, data: bytes) -> None:
         """Write data to process stdin."""
-        if self._close_called:
+        if self._close_called or self.proc is None:
             return
-        assert self.proc is not None  # for type checking
-        assert self.proc.stdin is not None  # for type checking
+        if self.proc.stdin is None:
+            return
         async with self._stdin_lock:
             self.proc.stdin.write(data)
-            with suppress(BrokenPipeError, ConnectionResetError):
-                await self.proc.stdin.drain()
+            await self.proc.stdin.drain()
+
+    @asynccontextmanager
+    async def stdin_quiesced(self, timeout: float = 5.0) -> AsyncIterator[bool]:
+        """
+        Hold stdin quiet for a block, with what was already written seen through to the pipe.
+
+        :meth:`write` only waits while the transport is paused, which it is only
+        above the high-water mark, so it returns with up to that much still queued
+        locally (64 KiB by default). This first sees those bytes through to the
+        kernel pipe -- as far as it can guarantee; whether the process has read
+        them is its own business -- and then keeps the write lock for the body, so
+        no :meth:`write` or :meth:`write_eof` can interleave. For a caller telling
+        the process something about the bytes it has been handed -- out of band,
+        and in a sequence the process must not see a write inside -- that turns
+        "we happen to have stopped writing" into something the block enforces.
+
+        Yields True when stdin was emptied, False when it could not be: the
+        process is then still owed bytes, so a caller whose message depends on it
+        having received everything must give up rather than send it.
+
+        :param timeout: Seconds to wait for the buffer to empty.
+        """
+        if self._close_called or self.proc is None or self.proc.stdin is None:
+            yield True
+            return
+        async with self._stdin_lock:
+            yield await self._drain_stdin_locked(timeout)
 
     async def write_eof(self) -> None:
         """Write end of file to to process stdin."""
-        if self._close_called:
+        if self._close_called or self.proc is None:
             return
-        assert self.proc is not None  # for type checking
-        assert self.proc.stdin is not None  # for type checking
+        if self.proc.stdin is None:
+            return
         async with self._stdin_lock:
             try:
                 if self.proc.stdin.can_write_eof():
@@ -207,30 +247,27 @@ class AsyncProcess:
             return b""
         assert self.proc is not None  # for type checking
         assert self.proc.stderr is not None  # for type checking
-        async with self._stderr_lock:
-            try:
-                return await self.proc.stderr.readline()
-            except ValueError as err:
-                # we're waiting for a line (separator found), but the line was too big
-                # this may happen with ffmpeg during a long (radio) stream where progress
-                # gets outputted to the stderr but no newline
-                # https://stackoverflow.com/questions/55457370/how-to-avoid-valueerror-separator-is-not-found-and-chunk-exceed-the-limit
-                # NOTE: this consumes the line that was too big
-                if "chunk exceed the limit" in str(err):
-                    return await self.proc.stderr.readline()
-                # raise for all other (value) errors
-                raise
+        return await self._readline(self.proc.stderr, self._stderr_lock)
 
-    async def iter_stderr(self) -> AsyncGenerator[str, None]:
+    async def read_stdout(self) -> bytes:
+        """Read line from stdout."""
+        # keyed on the close flag rather than the returncode (like read() and
+        # readexactly()): a process that already exited still has its last
+        # lines sitting in the stream buffer, and those must still be readable
+        if self._close_called:
+            return b""
+        assert self.proc is not None  # for type checking
+        assert self.proc.stdout is not None  # for type checking
+        return await self._readline(self.proc.stdout, self._stdout_lock)
+
+    async def iter_stderr(self) -> AsyncGenerator[str]:
         """Iterate lines from the stderr stream as string."""
-        line: str | bytes
-        while True:
-            line = await self.read_stderr()
-            if line == b"":
-                break
-            line = line.decode("utf-8", errors="ignore").strip()
-            if not line:
-                continue
+        async for line in self._iter_lines(self.read_stderr):
+            yield line
+
+    async def iter_stdout(self) -> AsyncGenerator[str]:
+        """Iterate lines from the stdout stream as string."""
+        async for line in self._iter_lines(self.read_stdout):
             yield line
 
     async def communicate(
@@ -249,21 +286,24 @@ class AsyncProcess:
         return (stdout, stderr)
 
     async def close(self) -> None:
-        """Close/terminate the process and wait for exit."""
+        """
+        Close/terminate the process and wait for exit.
+
+        An enclosing timeout is not a reliable bound on this call: the cleanup may
+        swallow the cancellation and run to completion, and a cancellation that does
+        land is only re-raised after the terminate/SIGKILL escalation has run.
+        """
+        if self._close_called and self.returncode is not None:
+            # Already closed and reaped, so there is nothing left to signal or
+            # drain. The stream locks below are still held by that first call
+            # and would only be waited out again (5s each).
+            return
         self._close_called = True
         if not self.proc:
             return
 
-        # cancel existing stdin feeder task if any
         if self._stdin_feeder_task:
-            if not self._stdin_feeder_task.done():
-                self._stdin_feeder_task.cancel()
-            # Always await the task to consume any exception and prevent
-            # "Task exception was never retrieved" errors.
-            # Suppress CancelledError (from cancel) and any other exception
-            # since exceptions have already been propagated through the generator chain.
-            with suppress(asyncio.CancelledError, Exception):
-                await self._stdin_feeder_task
+            await self._cancel_and_await(self._stdin_feeder_task, "stdin feeder")
 
         # close stdin to signal we're done sending data
         with suppress(TimeoutError, asyncio.CancelledError):
@@ -271,14 +311,20 @@ class AsyncProcess:
         if self.proc.stdin and not self.proc.stdin.is_closing():
             self.proc.stdin.close()
         elif not self.proc.stdin and self.proc.returncode is None:
-            self.proc.send_signal(SIGINT)
+            # the process may exit between the returncode check and the signal; guard the
+            # race the same way the SIGKILL delivery below does
+            with suppress(ProcessLookupError, OSError):
+                self.proc.send_signal(SIGINT)
+
+        # Cancellation landing on the drains or the reap below must not walk away from a
+        # child that is still running, so it is held here and re-raised at the very end.
+        cancelled: asyncio.CancelledError | None = None
 
         # ensure we have no more readers active and stdout is drained
         with suppress(TimeoutError, asyncio.CancelledError):
             await asyncio.wait_for(self._stdout_lock.acquire(), 5)
         if self.proc.stdout and not self.proc.stdout.at_eof():
-            with suppress(Exception):
-                await self.proc.stdout.read(-1)
+            cancelled = await self._drain_pipe(self.proc.stdout, cancelled)
         # if we have a stderr task active, allow it to finish
         if self._stderr_reader_task:
             with suppress(TimeoutError, asyncio.CancelledError):
@@ -287,8 +333,7 @@ class AsyncProcess:
             with suppress(TimeoutError, asyncio.CancelledError):
                 await asyncio.wait_for(self._stderr_lock.acquire(), 5)
             # drain stderr
-            with suppress(Exception):
-                await self.proc.stderr.read(-1)
+            cancelled = await self._drain_pipe(self.proc.stderr, cancelled)
 
         # make sure the process is really cleaned up.
         # especially with pipes this can cause deadlocks if not properly guarded
@@ -299,10 +344,12 @@ class AsyncProcess:
             try:
                 # use communicate to flush all pipe buffers
                 await asyncio.wait_for(self.proc.communicate(), 2)
-            except TimeoutError:
+            except (TimeoutError, asyncio.CancelledError) as err:
+                if isinstance(err, asyncio.CancelledError):
+                    cancelled = cancelled or err
                 terminate_attempts += 1
                 self.logger.debug(
-                    "Process %s with PID %s did not stop in time (attempt %d). Sending SIGKILL...",
+                    "Process %s with PID %s is still running (attempt %d). Sending SIGKILL...",
                     self.name,
                     pid,
                     terminate_attempts,
@@ -326,6 +373,8 @@ class AsyncProcess:
             self.proc.pid,
             self.returncode,
         )
+        if cancelled is not None:
+            raise cancelled
 
     async def kill(self) -> None:
         """
@@ -341,31 +390,33 @@ class AsyncProcess:
 
         pid = self.proc.pid
 
-        # Cancel stdin feeder task if any
-        if self._stdin_feeder_task and not self._stdin_feeder_task.done():
-            self._stdin_feeder_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await self._stdin_feeder_task
+        if self._stdin_feeder_task:
+            await self._cancel_and_await(self._stdin_feeder_task, "stdin feeder")
+        if self._stderr_reader_task:
+            await self._cancel_and_await(self._stderr_reader_task, "stderr reader")
 
-        # Cancel stderr reader task if any
-        if self._stderr_reader_task and not self._stderr_reader_task.done():
-            self._stderr_reader_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await self._stderr_reader_task
-
-        # Close all pipes first to prevent any I/O blocking
-        # This helps processes stuck on blocked I/O to receive signals
+        # Close stdin to signal we're done sending data
+        # Note: Don't manually call feed_eof() on stdout/stderr - this causes
+        # "feed_data after feed_eof" assertion errors when the subprocess transport
+        # still has buffered data to deliver. Let the process termination naturally
+        # close the streams.
         if self.proc.stdin and not self.proc.stdin.is_closing():
             self.proc.stdin.close()
-        if self.proc.stdout:
-            self.proc.stdout.feed_eof()
-        if self.proc.stderr:
-            self.proc.stderr.feed_eof()
 
         # Send SIGKILL immediately using os.kill for more direct signal delivery
         self.logger.debug("Killing process %s with PID %s", self.name, pid)
         with suppress(ProcessLookupError, OSError):
             os.kill(pid, 9)  # SIGKILL = 9
+
+        # SIGKILL leaves whatever the child already wrote in the pipes, and the reap
+        # below only completes once they disconnect - so drain them here rather than
+        # waiting that out for output nobody is going to read
+        try:
+            await asyncio.wait_for(self.proc.communicate(), 2)
+        except TimeoutError:
+            pass  # the escalation below takes over
+        except Exception as err:
+            self.logger.warning("Failed to drain the pipes of PID %s: %s", pid, err)
 
         # Wait for process to actually terminate
         try:
@@ -406,16 +457,136 @@ class AsyncProcess:
         """Attach a stderr reader task to this process."""
         self._stderr_reader_task = task
 
+    async def _readline(self, stream: asyncio.StreamReader, lock: asyncio.Lock) -> bytes:
+        """
+        Read a single line from one of the process' output streams.
 
-async def check_output(*args: str, env: dict[str, str] | None = None) -> tuple[int, bytes]:
-    """Run subprocess and return returncode and output."""
+        :param stream: The stream to read the line from.
+        :param lock: The lock guarding that stream's readers.
+        """
+        async with lock:
+            try:
+                return await stream.readline()
+            except ValueError as err:
+                # we're waiting for a line (separator found), but the line was too big
+                # this may happen with ffmpeg during a long (radio) stream where progress
+                # gets outputted to the stderr but no newline
+                # https://stackoverflow.com/questions/55457370/how-to-avoid-valueerror-separator-is-not-found-and-chunk-exceed-the-limit
+                # NOTE: this consumes the line that was too big
+                if "chunk exceed the limit" in str(err):
+                    return await stream.readline()
+                # raise for all other (value) errors
+                raise
+
+    async def _iter_lines(
+        self, read_line: Callable[[], Coroutine[Any, Any, bytes]]
+    ) -> AsyncGenerator[str]:
+        """
+        Yield decoded, non-empty lines until the underlying stream reaches EOF.
+
+        :param read_line: Coroutine function returning the next raw line.
+        """
+        while True:
+            raw = await read_line()
+            if raw == b"":
+                break
+            if line := raw.decode("utf-8", errors="ignore").strip():
+                yield line
+
+    async def _drain_pipe(
+        self, stream: asyncio.StreamReader, cancelled: asyncio.CancelledError | None
+    ) -> asyncio.CancelledError | None:
+        """
+        Read whatever is left in one of the process' pipes, bounded by the drain timeout.
+
+        :param stream: The stream to drain.
+        :param cancelled: A cancellation the caller already recorded, if any.
+        :return: The first cancellation seen, so the caller can re-raise it once the
+            process is reaped, or None when none has landed yet.
+        """
+        try:
+            with suppress(Exception):
+                await asyncio.wait_for(stream.read(-1), PIPE_DRAIN_TIMEOUT)
+        except asyncio.CancelledError as err:
+            return cancelled or err
+        return cancelled
+
+    async def _drain_stdin_locked(self, timeout: float) -> bool:
+        """
+        Empty the stdin write buffer, with the write lock already held.
+
+        :param timeout: Seconds to wait for the buffer to empty.
+        :return: True once the buffer is empty, False when the wait timed out.
+        """
+        assert self.proc is not None  # for type checking
+        assert self.proc.stdin is not None  # for type checking
+        transport = self.proc.stdin.transport
+        low, high = transport.get_write_buffer_limits()
+        try:
+            # Pausing the transport at a zero high-water mark is what makes
+            # drain() resolve only once the buffer is completely empty: it
+            # otherwise resolves as soon as the transport is not paused.
+            transport.set_write_buffer_limits(high=0)
+            await asyncio.wait_for(self.proc.stdin.drain(), timeout)
+        except TimeoutError:
+            return False
+        except BrokenPipeError, RuntimeError, ConnectionResetError:
+            # already exited, race condition: nothing is left to arrive
+            return True
+        finally:
+            # Restore what this process was configured with rather than the
+            # asyncio defaults a bare call would reinstate.
+            with suppress(RuntimeError):
+                transport.set_write_buffer_limits(high=high, low=low)
+        return True
+
+    async def _cancel_and_await(self, task: asyncio.Task[None], description: str) -> None:
+        """
+        Cancel one of this process' helper tasks and wait for it to end.
+
+        A task that already finished is awaited too, so it is never left with an
+        unretrieved exception. An unexpected error is logged rather than raised.
+
+        :param task: The task to cancel and await.
+        :param description: How the task is named when logging an unexpected error.
+        """
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass  # expected when we cancel the task
+        except Exception as err:
+            # retrieving the failure is what keeps asyncio from reporting it as
+            # unhandled once the task is collected, so log it here rather than
+            # dropping the only trace of it
+            self.logger.warning("The %s task ended with error: %s", description, err)
+
+
+async def check_output(
+    *args: str, env: dict[str, str] | None = None, timeout: float | None = None
+) -> tuple[int, bytes]:
+    """
+    Run subprocess and return returncode and output.
+
+    :param env: Optional environment overrides for the subprocess.
+    :param timeout: Maximum seconds to wait for the process to exit. On expiry the
+        process is killed and TimeoutError is raised; None (default) waits forever.
+    """
     proc = await asyncio.create_subprocess_exec(
         *args,
         stderr=asyncio.subprocess.STDOUT,
         stdout=asyncio.subprocess.PIPE,
         env=get_subprocess_env(env),
     )
-    stdout, _ = await proc.communicate()
+    try:
+        async with asyncio.timeout(timeout):
+            stdout, _ = await proc.communicate()
+    except TimeoutError:
+        proc.kill()
+        with suppress(ProcessLookupError):
+            await proc.wait()
+        raise
     assert proc.returncode is not None  # for type checking
     return (proc.returncode, stdout)
 

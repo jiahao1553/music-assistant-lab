@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
-from music_assistant_models.enums import ContentType, ImageType, MediaType
+from music_assistant_models.enums import ContentType, ImageType, LinkType, MediaType
 from music_assistant_models.errors import (
     InvalidDataError,
     LoginFailed,
@@ -18,11 +18,14 @@ from music_assistant_models.media_items import (
     AudioFormat,
     ItemMapping,
     MediaItemImage,
+    MediaItemLink,
     Podcast,
     PodcastEpisode,
     ProviderMapping,
     UniqueList,
 )
+
+from music_assistant.helpers.podcast_parsers import parse_podcast_persons
 
 from .constants import API_BASE_URL
 
@@ -142,21 +145,21 @@ def parse_podcast_from_feed(
 def parse_episode_from_data(
     episode_data: dict[str, Any],
     podcast_id: str,
-    episode_idx: int,
     instance_id: str,
     domain: str,
     podcast_name: str | None = None,
+    position: int = 0,
 ) -> PodcastEpisode | None:
-    """Parse episode from API episode data."""
+    """
+    Parse episode from API episode data.
+
+    :param position: The episode's listing position. Defaults to 0 (unknown).
+    """
     episode_api_id = episode_data.get("id")
     if not episode_api_id:
         return None
 
     episode_id = f"{podcast_id}|{episode_api_id}"
-
-    position = episode_data.get("episode")
-    if position is None:
-        position = episode_idx + 1
 
     if podcast_name is None:
         podcast_name = episode_data.get("feedTitle") or "Unknown Podcast"
@@ -164,7 +167,7 @@ def parse_episode_from_data(
     raw_duration = episode_data.get("duration")
     try:
         duration = int(raw_duration) if raw_duration is not None else 0
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         duration = 0
 
     episode = PodcastEpisode(
@@ -198,6 +201,14 @@ def parse_episode_from_data(
     # Add metadata
     episode.metadata.description = episode_data.get("description", "")
     episode.metadata.explicit = bool(episode_data.get("explicit", 0))
+
+    # hosts/guests (Podcast Index persons array), mapped to performer names
+    if performers := parse_podcast_persons(episode_data.get("persons")):
+        episode.metadata.performers = set(performers)
+
+    # episode webpage
+    if link := episode_data.get("link"):
+        episode.metadata.links = {MediaItemLink(type=LinkType.WEBSITE, url=link)}
 
     date_published = episode_data.get("datePublished")
     if date_published:

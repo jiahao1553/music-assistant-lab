@@ -107,7 +107,7 @@ def parse_album(album_obj: dict[str, Any], provider: SpotifyProvider) -> Album:
         },
     )
     if "external_ids" in album_obj and album_obj["external_ids"].get("upc"):
-        album.external_ids.add((ExternalID.BARCODE, "0" + album_obj["external_ids"]["upc"]))
+        album.external_ids.add((ExternalID.BARCODE, album_obj["external_ids"]["upc"]))
     if "external_ids" in album_obj and album_obj["external_ids"].get("ean"):
         album.external_ids.add((ExternalID.BARCODE, album_obj["external_ids"]["ean"]))
 
@@ -152,7 +152,7 @@ def parse_track(
         provider=provider.instance_id,
         name=name,
         version=version,
-        duration=track_obj["duration_ms"] / 1000,
+        duration=int(track_obj["duration_ms"] / 1000),
         provider_mappings={
             ProviderMapping(
                 item_id=track_obj["id"],
@@ -261,9 +261,10 @@ def parse_podcast(podcast_obj: dict[str, Any], provider: SpotifyProvider) -> Pod
     if "explicit" in podcast_obj:
         podcast.metadata.explicit = podcast_obj["explicit"]
 
-    # Convert languages list to genres for categorization
-    if "languages" in podcast_obj:
-        podcast.metadata.genres = set(podcast_obj["languages"])
+    if podcast_obj.get("languages"):
+        podcast.metadata.languages = UniqueList(podcast_obj["languages"])
+
+    podcast.metadata.genres = {"Spoken Word"}
 
     return podcast
 
@@ -272,27 +273,17 @@ def parse_podcast_episode(
     episode_obj: dict[str, Any], provider: SpotifyProvider, podcast: Podcast | None = None
 ) -> PodcastEpisode:
     """Parse spotify podcast episode object to generic layout."""
-    # Get or create a basic podcast reference if not provided
+    # The show object embedded in an episode carries the show's description,
+    # artwork and publisher, so parse it in full rather than as a name-only stub.
     if podcast is None and "show" in episode_obj:
-        podcast = Podcast(
-            item_id=episode_obj["show"]["id"],
-            provider=provider.instance_id,
-            name=episode_obj["show"]["name"],
-            provider_mappings={
-                ProviderMapping(
-                    item_id=episode_obj["show"]["id"],
-                    provider_domain=provider.domain,
-                    provider_instance=provider.instance_id,
-                    url=episode_obj["show"]["external_urls"]["spotify"],
-                )
-            },
-        )
+        podcast = parse_podcast(episode_obj["show"], provider)
     elif podcast is None:
         # Create a minimal podcast reference if none available
         podcast = Podcast(
             item_id="unknown",
             provider=provider.instance_id,
             name="Unknown Podcast",
+            translation_key="unknown_podcast",
             provider_mappings=set(),
         )
 
@@ -401,7 +392,9 @@ def parse_audiobook(audiobook_obj: dict[str, Any], provider: SpotifyProvider) ->
         audiobook.metadata.explicit = audiobook_obj["explicit"]
 
     if audiobook_obj.get("languages"):
-        audiobook.metadata.languages = audiobook_obj["languages"][0]
+        audiobook.metadata.languages = UniqueList(audiobook_obj["languages"])
+
+    audiobook.metadata.genres = {"Spoken Word"}
 
     # Set publication date if available
     if audiobook_obj.get("publication_date"):

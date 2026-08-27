@@ -46,7 +46,7 @@ The `PlayerState` is a dataclass representing the final state of the player. It:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Player (Internal)                            │
+│                     Player (Internal)                           │
 │  - Provider-specific implementation                             │
 │  - Control methods (play, pause, volume_set, etc.)              │
 │  - Raw state (_attr_volume_level, _attr_playback_state, etc.)   │
@@ -161,9 +161,13 @@ Protocol players are matched to the same physical device using identifiers in or
 1. **MAC_ADDRESS** - Most reliable, unique to the network interface
 2. **SERIAL_NUMBER** - Unique device serial number
 3. **UUID** - Universally unique identifier
-4. **player_id** - Fallback for players without identifiers (e.g., Sendspin)
+4. **CAST_UUID / AIRPLAY_ID** - Protocol-specific stable identifiers
+5. **IP_ADDRESS** - Last resort only when strong identifiers are unavailable or unreliable
+6. **player_id** - Fallback device key for players without usable identifiers (e.g., Sendspin)
 
-**Note:** IP_ADDRESS is intentionally NOT used for matching as it can change with DHCP and cause incorrect matches between different devices.
+**Note:** IP matching is intentionally conservative. The controller prefers strong identifiers first, verifies MAC addresses with ARP where possible, and only falls back to IP when at least one side lacks a reliable hardware identifier or when a protocol/universal player still needs a last-resort match.
+
+**Important:** Protocol players from the **same protocol domain** (same provider.domain) will NOT be matched together, even if they share the same MAC/IP address. This is intentional to handle multiple software player instances (e.g., multiple Snapcast clients, multiple SendSpin web players) running on the same host. These are separate logical players, not multiple protocols of the same physical device.
 
 **Fallback behavior:** Protocol players that don't expose any identifiers (like Sendspin clients) will still get wrapped in a Universal Player using their player_id as the device key. This ensures all protocol players get a consistent user-facing interface.
 
@@ -200,13 +204,13 @@ A Universal Player is created when:
 1. Protocol player registered with PlayerType.PROTOCOL
 2. Controller checks for cached parent_id from previous session:
    - If found, restores link immediately (skips evaluation)
-   - If parent not yet registered, waits without creating universal player
+   - If parent not yet registered, keeps waiting without creating a universal player
 3. If no cached parent, checks for matching native player (links immediately if found)
 4. If no native player, schedules delayed evaluation:
-   - 10 seconds standard delay (allows other protocols to register)
-   - 30 seconds if previously linked to a native player (allows native provider to start)
+   - 15 seconds standard delay (allows other protocols to register)
+   - 45 seconds if previously linked to a parent that is not registered yet
 5. After delay, finds all matching protocol players by identifiers
-6. Creates UniversalPlayer and links all protocols
+6. Creates or updates a UniversalPlayer and links all matching protocols
 7. Protocol players become hidden, Universal Player visible
 ```
 
@@ -224,7 +228,7 @@ When a native player (e.g., Sonos) is registered, the controller:
 When protocol players are registered without a native match:
 1. Each protocol player schedules a delayed evaluation
 2. After the delay, matching protocols are grouped
-3. A Universal Player is created to wrap them all
+3. A Universal Player is created even for a single unmatched protocol player
 4. All protocol players link to the Universal Player
 
 ### Universal to Native Promotion
@@ -232,7 +236,7 @@ When protocol players are registered without a native match:
 When a native player appears for a device that has a Universal Player:
 1. Native player is registered
 2. Controller finds matching Universal Player
-3. All protocol links transfer to the native player
+3. Active and cached protocol ownership transfers to the native player
 4. Universal Player is removed
 5. Native player becomes the visible entity
 
@@ -285,14 +289,16 @@ When implementing a native provider (e.g., Sonos, Bluesound) that should link to
 - `MAC_ADDRESS` - Most reliable, unique to network interface
 - `SERIAL_NUMBER` - Unique device serial number
 - `UUID` - Universally unique identifier
-- `player_id` - Fallback when no identifiers available
+- `CAST_UUID` / `AIRPLAY_ID` - Protocol-specific stable identifiers
+- `IP_ADDRESS` - Last resort fallback when strong identifiers are not usable
+- `player_id` - Fallback device key when no identifiers are available
 
 **Important Notes:**
 - **Always validate MAC addresses** using `is_valid_mac_address()` before adding them
   - Rejects invalid MACs like `00:00:00:00:00:00` or `ff:ff:ff:ff:ff:ff`
   - Prevents false matches between unrelated devices
   - The controller will attempt ARP lookup to resolve real MACs automatically
-- `IP_ADDRESS` is NOT used for matching as it can change with DHCP
+- `IP_ADDRESS` is only used as a last resort after strong identifiers were checked first
 
 ### Testing Protocol Linking
 
@@ -301,13 +307,15 @@ Key scenarios to test:
 1. **Single protocol device** - Should create Universal Player
 2. **Multi-protocol device** - All protocols linked to one Universal Player
 3. **Late protocol discovery** - New protocol added to existing Universal Player
-4. **Native player appears** - Universal Player replaced by native
-5. **Protocol disappears** - Handle graceful degradation
+4. **Native player appears** - Universal Player replaced by native; its user
+   settings (name, config values, DSP and queue settings) carry over
+5. **Permanent parent removal** - Protocol links reset and discovery is re-scheduled
+6. **Protocol disappears** - Handle graceful degradation
 
 ### Configuration Storage
 
 Protocol links are persisted in player configuration:
-- `linked_protocol_player_ids` - List of protocol player IDs
+- `linked_protocol_ids` - List of protocol player IDs
 - Restored on restart for fast reconnection
 
 ### Key Methods (in protocol_linking.py)

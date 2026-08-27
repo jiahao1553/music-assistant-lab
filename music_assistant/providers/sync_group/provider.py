@@ -14,11 +14,18 @@ from .constants import SGP_PREFIX
 from .player import SyncGroupPlayer
 
 if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ConfigEntry
+
     from music_assistant.models.player import Player
 
 
 class SyncGroupProvider(PlayerProvider):
     """Sync Group Player Provider."""
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to setup this provider."""
+        # nothing to configure (for now)
+        return ()
 
     async def create_group_player(
         self, name: str, members: list[str], dynamic: bool = True
@@ -41,7 +48,7 @@ class SyncGroupProvider(PlayerProvider):
             if not can_group_with:
                 # first member, add all its compatible players to the can_group_with set
                 can_group_with = set(member.state.can_group_with)
-            if member_id not in can_group_with:
+            elif member_id not in can_group_with:
                 # member is not compatible with the current group, skip it
                 continue
             final_members.append(member_id)
