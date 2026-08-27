@@ -166,6 +166,9 @@ class SendspinPlayer(Player):
             controller_role.set_supported_commands(SUPPORTED_GROUP_COMMANDS)
 
         self.playback_session = SendspinPlaybackSession(self)
+        # play_media() stops the group before starting the new session. Ignore the
+        # resulting STOPPED event so it cannot cancel that new session.
+        self._starting_new_media = False
 
         self.logger = self.provider.logger.getChild(player_id)
         # init some static variables
@@ -329,11 +332,14 @@ class SendspinPlayer(Player):
                     case PlaybackStateType.PAUSED:
                         self._attr_playback_state = PlaybackState.PAUSED
                     case PlaybackStateType.STOPPED:
-                        self._attr_playback_state = PlaybackState.IDLE
-                        self._attr_elapsed_time = 0
-                        self._attr_elapsed_time_last_updated = time.time()
-                        if self.synced_to is None:
-                            self.mass.create_task(self.playback_session.cancel("group stopped"))
+                        # play_media() calls group.stop() before starting the new session.
+                        # Ignore that STOPPED so the deferred cancel cannot kill the new playback.
+                        if not self._starting_new_media:
+                            self._attr_playback_state = PlaybackState.IDLE
+                            self._attr_elapsed_time = 0
+                            self._attr_elapsed_time_last_updated = time.time()
+                            if self.synced_to is None:
+                                self.mass.create_task(self.playback_session.cancel("group stopped"))
                 self.update_state()
             case GroupMemberAddedEvent(client_id=client_id):
                 is_group_leader = (
@@ -409,10 +415,15 @@ class SendspinPlayer(Player):
         self._attr_elapsed_time_last_updated = time.time()
         # playback_state will be set by the group state change event
 
-        # Stop previous stream in case we were already playing something
-        await self.playback_session.cancel("new media requested")
-        await self.api.group.stop()
-        await self.playback_session.start(media)
+        # Stop previous stream in case we were already playing something.
+        # group.stop() emits STOPPED; _starting_new_media tells the handler to ignore it.
+        self._starting_new_media = True
+        try:
+            await self.playback_session.cancel("new media requested")
+            await self.api.group.stop()
+            await self.playback_session.start(media)
+        finally:
+            self._starting_new_media = False
         self.update_state()
 
     async def on_config_updated(self) -> None:

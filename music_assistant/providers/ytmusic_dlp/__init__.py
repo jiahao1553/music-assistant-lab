@@ -521,8 +521,9 @@ class YoutubeMusicDlpProvider(MusicProvider):
             "extractor_args": {
                 "youtube": {
                     "skip": ["translated_subs", "dash"],
-                    "player_client": ["tv_embedded", "ios", "mweb"],
-                    "player_skip": ["webpage"],
+                    # tv_embedded was removed from yt-dlp; ios/mweb require PO Tokens.
+                    # These clients still return audio without a PO Token provider.
+                    "player_client": ["web_embedded", "android_vr", "visionos"],
                 },
             },
         }
