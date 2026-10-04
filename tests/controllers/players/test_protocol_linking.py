@@ -18,6 +18,8 @@ from music_assistant_models.enums import (
     PlayerFeature,
     PlayerType,
 )
+from music_assistant_models.media_items import AudioSource
+from music_assistant_models.media_items.provider_mapping import ProviderMapping
 from music_assistant_models.player import PlayerMedia
 
 from music_assistant.constants import (
@@ -3885,6 +3887,65 @@ class TestProtocolSwitchingDuringPlayback:
         )
 
         assert observed_volume_controls == ["joiner_airplay"]
+
+    async def test_leaving_member_releases_its_protocol(self, mock_mass: MagicMock) -> None:
+        """A member that leaves a protocol group reports playback started on the device again."""
+        controller = PlayerController(mock_mass)
+        sendspin_provider = MockProvider("sendspin", instance_id="sendspin", mass=mock_mass)
+        sonos_provider = MockProvider("sonos", instance_id="sonos", mass=mock_mass)
+
+        leader = MockPlayer(sendspin_provider, "leader", "LedFx")
+        leader_sendspin = MockPlayer(
+            sendspin_provider, "leader_sendspin", "LedFx", player_type=PlayerType.PROTOCOL
+        )
+        leader_sendspin._attr_supported_features.add(PlayerFeature.SET_MEMBERS)
+        leader_sendspin.set_protocol_parent_id("leader")
+
+        member = MockPlayer(sonos_provider, "member", "Living Room")
+        member_bridge = MockPlayer(
+            sendspin_provider,
+            "member_bridge",
+            "Living Room (Sendspin)",
+            player_type=PlayerType.PROTOCOL,
+        )
+        member_bridge.set_protocol_parent_id("member")
+        member.set_linked_output_protocols(
+            [
+                LinkedOutputProtocol(
+                    output_protocol_id="member_bridge", protocol_domain="sendspin", priority=40
+                )
+            ]
+        )
+
+        mock_mass.players = controller
+        controller._players = {
+            player.player_id: player for player in (leader, leader_sendspin, member, member_bridge)
+        }
+        for player in controller._players.values():
+            player.update_state(signal_event=False)
+
+        await controller._forward_protocol_set_members(
+            parent_player=leader,
+            parent_protocol_player=leader_sendspin,
+            protocol_members_to_add=["member_bridge"],
+            protocol_members_to_remove=[],
+        )
+        joined_protocol = member.active_output_protocol
+
+        await controller._forward_protocol_set_members(
+            parent_player=leader,
+            parent_protocol_player=leader_sendspin,
+            protocol_members_to_add=[],
+            protocol_members_to_remove=["member_bridge"],
+        )
+        assert (joined_protocol, member.active_output_protocol) == ("member_bridge", None)
+
+        member._attr_playback_state = PlaybackState.PLAYING
+        member._attr_active_source = "Amazon Music"
+        member.update_state(signal_event=False)
+
+        assert member.state.playback_state == PlaybackState.PLAYING
+        assert member.state.active_source == "Amazon Music"
 
 
 class TestNativeProtocolPlayerGrouping:
@@ -10718,6 +10779,135 @@ class TestUniversalPlayerRestoreOrphanCleanup:
         )
 
     @pytest.mark.asyncio
+    async def test_native_owning_the_same_domain_does_not_claim_wrapper(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """A native listing a foreign AirPlay next to its own AirPlay doesn't replace the wrapper."""
+        provider = create_mock_universal_provider(mock_mass)
+        universal_id = "up_jbl"
+        native_id = "wiim_uuid:FF970016"
+        own_ap_id = "ap_wiim"
+        foreign_ap_id = "ap_jbl"
+
+        all_configs = {
+            universal_id: {
+                "provider": "universal_player",
+                "values": {
+                    "linked_protocol_ids": [foreign_ap_id],
+                    "device_identifiers": {},
+                    "device_info": {},
+                },
+                "name": "JBL",
+            },
+            native_id: {
+                "enabled": True,
+                "provider": "wiim",
+                "player_type": "player",
+                "values": {"linked_protocol_ids": [own_ap_id, foreign_ap_id]},
+            },
+            own_ap_id: {
+                "provider": "airplay",
+                "player_type": "protocol",
+                "enabled": True,
+                "values": {"protocol_parent_id": native_id},
+            },
+            foreign_ap_id: {
+                "provider": "airplay",
+                "player_type": "protocol",
+                "enabled": True,
+                "values": {"protocol_parent_id": universal_id},
+            },
+        }
+
+        def _config_get(key: str, default: object = None) -> object:
+            if key == CONF_PLAYERS:
+                return all_configs
+            if key.startswith(f"{CONF_PLAYERS}/"):
+                pid = key.split("/", 1)[1]
+                return all_configs.get(pid, default)
+            return default
+
+        mock_mass.config.get.side_effect = _config_get
+        mock_mass.config.set = MagicMock()
+        mock_mass.config.save_player_config = AsyncMock()
+        mock_mass.players = MagicMock()
+        mock_mass.players.get_player = MagicMock(return_value=None)
+        mock_mass.players.register_or_update = AsyncMock()
+
+        await provider._restore_player(universal_id)
+
+        mock_mass.players.register_or_update.assert_awaited_once()
+        assert not any(
+            "protocol_parent_id" in call.args[0] for call in mock_mass.config.set.call_args_list
+        )
+        mock_mass.players.delete_player_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_parent_link_on_a_native_config_does_not_block_takeover(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """A non-protocol config still pointing at the native doesn't count as an owned output."""
+        provider = create_mock_universal_provider(mock_mass)
+        universal_id = "up_edifier"
+        shell_id = "wiim_uuid:FF97F002-783E-6505-6579-F15FFF97F002"
+        ap_id = "airplay_edifier"
+        web_player_id = "sendspin_web_player"
+
+        all_configs = {
+            universal_id: {
+                "provider": "universal_player",
+                "values": {
+                    "linked_protocol_ids": [ap_id],
+                    "device_identifiers": {},
+                    "device_info": {},
+                },
+                "name": "Edifier MS50A",
+            },
+            shell_id: {
+                "enabled": True,
+                "provider": "wiim",
+                "player_type": "player",
+                "values": {"linked_protocol_ids": [ap_id]},
+            },
+            ap_id: {
+                "provider": "airplay",
+                "player_type": "protocol",
+                "enabled": True,
+                "values": {"protocol_parent_id": universal_id},
+            },
+            # a former bridge client that turned web player keeps its parent link
+            # until it registers again; its provider shares the wrapper's domain
+            web_player_id: {
+                "provider": "airplay",
+                "player_type": "player",
+                "enabled": True,
+                "values": {"protocol_parent_id": shell_id},
+            },
+        }
+
+        def _config_get(key: str, default: object = None) -> object:
+            if key == CONF_PLAYERS:
+                return all_configs
+            if key.startswith(f"{CONF_PLAYERS}/"):
+                pid = key.split("/", 1)[1]
+                return all_configs.get(pid, default)
+            return default
+
+        mock_mass.config.get.side_effect = _config_get
+        mock_mass.config.set = MagicMock()
+        mock_mass.config.save_player_config = AsyncMock()
+        mock_mass.players = MagicMock()
+        mock_mass.players.get_player = MagicMock(return_value=None)
+        mock_mass.players.register_or_update = AsyncMock()
+
+        await provider._restore_player(universal_id)
+
+        mock_mass.players.delete_player_config.assert_called_once_with(
+            universal_id, replacement_player_id=shell_id
+        )
+        mock_mass.players.register_or_update.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_protocols_reparented_to_their_own_native_claimer(
         self, mock_mass: MagicMock
     ) -> None:
@@ -12232,3 +12422,171 @@ class TestPreferNativeGrouping:
         # with no preferred/active/common protocol, the default player still reaches
         # native grouping via the normal priority (Priority 3), not the preferred seam
         assert native_members == ["plain_child"]
+
+
+def _live_source(item_id: str, provider: str = "spotify_connect") -> AudioSource:
+    """Build the AudioSource a live session publishes on a player."""
+    return AudioSource(
+        item_id=item_id,
+        provider=provider,
+        name=f"Live source ({item_id})",
+        provider_mappings={
+            ProviderMapping(item_id=item_id, provider_domain=provider, provider_instance=provider)
+        },
+    )
+
+
+class TestCanGroupWithExternalSource:
+    """Grouping candidates while something other than the player's queue is playing."""
+
+    @staticmethod
+    def _build_rig(mock_mass: MagicMock) -> tuple[PlayerController, MockPlayer]:
+        """
+        Wire a player with one native peer and one reachable only over AirPlay.
+
+        Returns the controller and the player whose grouping candidates are asserted on.
+        """
+        controller = PlayerController(mock_mass)
+        sonos_provider = MockProvider("sonos", instance_id="sonos_instance", mass=mock_mass)
+        airplay_provider = MockProvider("airplay", instance_id="airplay_instance", mass=mock_mass)
+
+        sonos_player = MockPlayer(
+            sonos_provider,
+            "sonos_123",
+            "Living Room",
+            identifiers={IdentifierType.MAC_ADDRESS: "AA:BB:CC:DD:EE:01"},
+        )
+        sonos_player._attr_supported_features.add(PlayerFeature.PLAY_MEDIA)
+        sonos_player._attr_supported_features.add(PlayerFeature.SET_MEMBERS)
+        sonos_player._attr_can_group_with = {"sonos_456"}
+        sonos_player_b = MockPlayer(
+            sonos_provider,
+            "sonos_456",
+            "Kitchen",
+            identifiers={IdentifierType.MAC_ADDRESS: "AA:BB:CC:DD:EE:02"},
+        )
+        sonos_airplay = MockPlayer(
+            airplay_provider,
+            "airplay_sonos",
+            "Living Room (AirPlay)",
+            player_type=PlayerType.PROTOCOL,
+            identifiers={IdentifierType.MAC_ADDRESS: "AA:BB:CC:DD:EE:01"},
+        )
+        sonos_airplay._attr_supported_features.add(PlayerFeature.SET_MEMBERS)
+        sonos_airplay._attr_can_group_with = {"airplay_other"}
+        sonos_airplay.set_protocol_parent_id("sonos_123")
+
+        wiim_player = MockPlayer(
+            sonos_provider,
+            "wiim_789",
+            "Bedroom",
+            identifiers={IdentifierType.MAC_ADDRESS: "AA:BB:CC:DD:EE:03"},
+        )
+        airplay_other = MockPlayer(
+            airplay_provider,
+            "airplay_other",
+            "Bedroom (AirPlay)",
+            player_type=PlayerType.PROTOCOL,
+            identifiers={IdentifierType.MAC_ADDRESS: "AA:BB:CC:DD:EE:03"},
+        )
+        airplay_other._attr_supported_features.add(PlayerFeature.SET_MEMBERS)
+        airplay_other._attr_can_group_with = {"airplay_sonos"}
+        airplay_other.set_protocol_parent_id("wiim_789")
+
+        for player, protocol_id in (
+            (sonos_player, "airplay_sonos"),
+            (wiim_player, "airplay_other"),
+        ):
+            player.set_linked_output_protocols(
+                [
+                    LinkedOutputProtocol(
+                        output_protocol_id=protocol_id,
+                        protocol_domain="airplay",
+                        priority=10,
+                    )
+                ]
+            )
+
+        mock_mass.players = controller
+        # nothing here is a registered queue, so the external-source check is reachable
+        mock_mass.player_queues.get = MagicMock(return_value=None)
+        controller._players = {
+            "sonos_123": sonos_player,
+            "sonos_456": sonos_player_b,
+            "wiim_789": wiim_player,
+            "airplay_sonos": sonos_airplay,
+            "airplay_other": airplay_other,
+        }
+        for registered in controller._players.values():
+            registered._cache.clear()
+        sonos_airplay.refresh_state(signal_event=False)
+        airplay_other.refresh_state(signal_event=False)
+        sonos_player.refresh_state(signal_event=False)
+        sonos_player_b.refresh_state(signal_event=False)
+        wiim_player.refresh_state(signal_event=False)
+        return controller, sonos_player
+
+    def test_live_audio_source_keeps_protocol_candidates(self, mock_mass: MagicMock) -> None:
+        """A source MA streams itself (e.g. Spotify Connect) can still be grouped."""
+        controller, sonos_player = self._build_rig(mock_mass)
+        controller._start_audio_source_session(
+            "sonos_123", _live_source("sonos_123"), "spotify_connect"
+        )
+        sonos_player.refresh_state(signal_event=False)
+
+        assert sonos_player.state.active_source == "spotify_connect://audio_source/sonos_123"
+        # MA produces the audio, so both the native peer and the one reachable
+        # only over AirPlay can be added to it
+        assert sonos_player.state.can_group_with == {"sonos_456", "wiim_789"}
+
+    def test_device_own_external_source_hides_protocol_candidates(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """The device can still group its own line-in natively, just not over a protocol."""
+        controller, sonos_player = self._build_rig(mock_mass)
+        # a live source elsewhere says nothing about what this player is playing
+        controller._start_audio_source_session("wiim_789", _live_source("wiim_789"), "vban")
+        sonos_player._attr_active_source = "tv"
+        sonos_player._attr_playback_state = PlaybackState.PLAYING
+        sonos_player.refresh_state(signal_event=False)
+
+        assert sonos_player.state.active_source == "tv"
+        # the device distributes its own input to its own kind, but MA cannot put
+        # audio it never receives onto an AirPlay/Sendspin protocol player
+        assert sonos_player.state.can_group_with == {"sonos_456"}
+
+
+class TestExternalSourceTakeover:
+    """Whether a source change while a protocol renders the audio counts as a takeover."""
+
+    @staticmethod
+    def _playing_over_airplay(
+        mock_mass: MagicMock,
+    ) -> tuple[PlayerController, MockPlayer]:
+        """Wire a player rendering through its AirPlay protocol player."""
+        controller, sonos_player = TestCanGroupWithExternalSource._build_rig(mock_mass)
+        sonos_player._attr_playback_state = PlaybackState.PLAYING
+        sonos_player.set_active_output_protocol("airplay_sonos")
+        sonos_player.refresh_state(signal_event=False)
+        return controller, sonos_player
+
+    def test_live_audio_source_is_not_a_takeover(self, mock_mass: MagicMock) -> None:
+        """MA putting a live source on the player must not tear down its protocol group."""
+        controller, sonos_player = self._playing_over_airplay(mock_mass)
+        controller._start_audio_source_session(
+            "sonos_123", _live_source("sonos_123"), "spotify_connect"
+        )
+        sonos_player.refresh_state(signal_event=False)
+
+        controller._check_external_source_takeover(sonos_player)
+
+        assert sonos_player.active_output_protocol == "airplay_sonos"
+
+    def test_device_own_external_source_stays_external(self, mock_mass: MagicMock) -> None:
+        """A source MA does not produce is still classified as external."""
+        # checked on the classifier directly: while an output protocol renders the audio,
+        # __final_active_source overrules what the device reports, so a device-local
+        # source cannot be driven through _check_external_source_takeover at all
+        controller, sonos_player = TestCanGroupWithExternalSource._build_rig(mock_mass)
+
+        assert not controller._is_ma_managed_source(sonos_player, "tv")
