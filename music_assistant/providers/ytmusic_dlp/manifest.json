@@ -1,0 +1,11 @@
+{
+  "type": "music",
+  "domain": "ytmusic_dlp",
+  "stage": "beta",
+  "name": "YouTube Music (Anonymous)",
+  "description": "Search and play songs from YouTube Music without requiring a login. Audio is downloaded to a local cache directory using yt-dlp and played from there.",
+  "codeowners": ["@MarvinSchenkel"],
+  "requirements": ["yt-dlp[default]"],
+  "documentation": "https://music-assistant.io/music-providers/youtube-music/",
+  "multi_instance": true
+}
