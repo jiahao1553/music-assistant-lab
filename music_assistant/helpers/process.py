@@ -13,6 +13,7 @@ import logging
 import os
 
 # if TYPE_CHECKING:
+from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -31,6 +32,8 @@ DEFAULT_CHUNKSIZE = 64000
 # terminate/SIGKILL escalation that actually reaps it.
 PIPE_DRAIN_TIMEOUT = 5
 
+_PROC_ROOT = Path("/proc")
+
 
 def get_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
     """Get environment for subprocess, stripping LD_PRELOAD to avoid jemalloc warnings."""
@@ -39,6 +42,62 @@ def get_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
     if env:
         result.update(env)
     return result
+
+
+def collect_child_process_counts(
+    proc_root: Path = _PROC_ROOT, parent_pid: int | None = None
+) -> dict[str, int] | None:
+    """
+    Return the server's direct child processes grouped by process name.
+
+    Reads Linux /proc so stranded children, such as ffmpeg left behind by an interrupted
+    stream, show up in the always-on diagnostics dump without a psutil dependency. Returns
+    None where /proc is unavailable, for example on non-Linux platforms.
+
+    :param proc_root: Mount point of the proc filesystem (overridable for tests).
+    :param parent_pid: Pid whose children are counted (defaults to this process).
+    """
+    if parent_pid is None:
+        parent_pid = os.getpid()
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    counts: Counter[str] = Counter()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            # a comm may hold non-UTF-8 bytes, so decode leniently rather than raise
+            stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            # the process may exit between listing /proc and reading its stat file
+            continue
+        name = parse_child_process_name(stat, parent_pid)
+        if name is not None:
+            counts[name] += 1
+    return dict(sorted(counts.items()))
+
+
+def parse_child_process_name(stat: str, parent_pid: int) -> str | None:
+    """
+    Return the process name from a /proc/<pid>/stat line, or None if it is not a child.
+
+    :param stat: Contents of a /proc/<pid>/stat file.
+    :param parent_pid: Only a line whose parent pid equals this value returns a name.
+    """
+    # the comm field is parenthesized and may itself contain spaces or ')', so anchor on
+    # the last ')': the fields after it start at state, with ppid the second of those.
+    name_start = stat.find("(")
+    name_end = stat.rfind(")")
+    if name_start == -1 or name_end < name_start:
+        return None
+    fields = stat[name_end + 1 :].split()
+    if len(fields) < 2 or not fields[1].isdigit():
+        return None
+    if int(fields[1]) != parent_pid:
+        return None
+    return stat[name_start + 1 : name_end]
 
 
 class AsyncProcess:
@@ -196,7 +255,14 @@ class AsyncProcess:
             return await self.proc.stdout.read(n)
 
     async def write(self, data: bytes) -> None:
-        """Write data to process stdin."""
+        """
+        Write data to process stdin.
+
+        Data handed over after :meth:`write_eof` is dropped rather than queued:
+        the transport closed the pipe behind that eof and it cannot be reopened.
+
+        :param data: Bytes to write.
+        """
         if self._close_called or self.proc is None:
             return
         if self.proc.stdin is None:
@@ -238,12 +304,12 @@ class AsyncProcess:
 
     async def write_eof(self) -> None:
         """Write end of file to to process stdin."""
-        if self._close_called or self._stdin_eof or self.proc is None:
-            return
-        if self.proc.stdin is None:
+        if self._close_called or self.proc is None or self.proc.stdin is None:
             return
         async with self._stdin_lock:
-            if not self.proc.stdin.can_write_eof():
+            # checked under the lock, like write(): a second end of file that
+            # waited here has nothing left to close
+            if self._stdin_eof or not self.proc.stdin.can_write_eof():
                 return
             # whatever the write below does, stdin is spent: the transport closes
             # the pipe on eof, and every error it raises is a pipe already gone
@@ -580,7 +646,17 @@ class AsyncProcess:
             # retrieving the failure is what keeps asyncio from reporting it as
             # unhandled once the task is collected, so log it here rather than
             # dropping the only trace of it
-            self.logger.warning("The %s task ended with error: %s", description, err)
+            level = logging.DEBUG if self._is_expected_task_error(err) else logging.WARNING
+            self.logger.log(level, "The %s task ended with error: %s", description, err)
+
+    def _is_expected_task_error(self, err: BaseException) -> bool:
+        """
+        Return whether a helper task error is an expected outcome rather than a failure.
+
+        Subclasses override this to keep known-benign errors out of the warning
+        log; such errors are still logged, at debug level.
+        """
+        return False
 
 
 async def check_output(

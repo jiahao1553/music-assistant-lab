@@ -45,6 +45,7 @@ from aiosendspin.server import (
     SendspinEvent,
     SendspinServer,
 )
+from aiosendspin.server.roles.registry import role_requires_pairing
 from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
@@ -78,6 +79,7 @@ from music_assistant.helpers.guest_access import (
     is_session_scoped_owner,
 )
 from music_assistant.helpers.util import format_ip_for_url
+from music_assistant.helpers.virtual_player import cleanup_virtual_player
 from music_assistant.mass import MusicAssistant
 from music_assistant.models.player import Player
 from music_assistant.models.player_provider import PlayerProvider
@@ -365,6 +367,7 @@ class SendspinProvider(PlayerProvider):
     _virtual_players: dict[str, str]
     _unloading: bool
     _hass_available: bool
+    _server_start_failed: bool
 
     def __init__(
         self, mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
@@ -395,6 +398,7 @@ class SendspinProvider(PlayerProvider):
         ] = {}
         self._unloading = False
         self._hass_available = False
+        self._server_start_failed = False
         self.unregister_cbs = []
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
@@ -1059,11 +1063,22 @@ class SendspinProvider(PlayerProvider):
         self._remove_orphan_virtual_player_configs()
         # Start server for handling incoming Sendspin connections from clients
         # and mDNS discovery of new clients
-        await self.server_api.start_server(
-            port=SENDSPIN_SERVER_PORT,
-            host=self.mass.streams.bind_ip,
-            advertise_addresses=[self.mass.streams.publish_ip],
-        )
+        try:
+            await self.server_api.start_server(
+                port=SENDSPIN_SERVER_PORT,
+                host=self.mass.streams.bind_ip,
+                advertise_addresses=[self.mass.streams.publish_ip],
+            )
+        except OSError as err:
+            self._server_start_failed = True
+            # without its listener every Sendspin player fails silently,
+            # so surface this as a provider error the user can see
+            self.unload_with_error(
+                SetupFailedError(
+                    f"Could not start the Sendspin server on port {SENDSPIN_SERVER_PORT}: {err}"
+                )
+            )
+            return
         for address in self._manual_ip_config:
             try:
                 url = _manual_client_url(address)
@@ -1104,8 +1119,10 @@ class SendspinProvider(PlayerProvider):
         if self._running_pairing_evictions:
             await asyncio.gather(*self._running_pairing_evictions, return_exceptions=True)
         player_ids = [player.player_id for player in self.players]
-        # Stop the Sendspin server
-        await self.server_api.close()
+        # Stop the Sendspin server. A failed start already cleaned up after itself,
+        # and closing it then raises (aiosendspin keeps a stale site reference).
+        if not self._server_start_failed:
+            await self.server_api.close()
 
         for cb in self.unregister_cbs:
             cb()
@@ -1561,14 +1578,7 @@ class SendspinProvider(PlayerProvider):
             if sendspin_client is None:
                 self.logger.debug("Client %s disconnected before hello completed", client_id)
                 return
-            # Wait for client hello to be processed (info becomes available)
-            # ClientAddedEvent fires before the hello handshake completes
-            for _ in range(50):  # Wait up to 5 seconds
-                if sendspin_client.info_or_none is not None:
-                    break
-                await asyncio.sleep(0.1)
-            else:
-                self.logger.warning("Client %s hello not received within timeout", client_id)
+            if not await self._await_client_hello(client_id, sendspin_client):
                 return
             if not self._is_current_client_event(client_id, event_version):
                 self.logger.debug("Skipping stale add event for %s", client_id)
@@ -1576,6 +1586,7 @@ class SendspinProvider(PlayerProvider):
             if not self.mass.config.get_raw_player_config_value(client_id, CONF_ENABLED, True):
                 self.logger.debug("Ignoring disabled sendspin client: %s", client_id)
                 return
+            await self._auto_trust_guest_access(client_id, sendspin_client, event_version)
             existing_player = self.mass.players.get_player(client_id)
             preserved_identifiers = (
                 dict(existing_player.device_info.identifiers) if existing_player is not None else {}
@@ -1611,6 +1622,56 @@ class SendspinProvider(PlayerProvider):
                 player._unsubscribe_client_callbacks()
         finally:
             self._finish_client_event(client_id)
+
+    async def _await_client_hello(self, client_id: str, sendspin_client: SendspinClient) -> bool:
+        """
+        Wait for a just-connected client's hello, reporting whether it arrived.
+
+        ``ClientAddedEvent`` fires before the hello handshake completes, so everything
+        that reads the client's advertisement has to wait for it first.
+
+        :param client_id: The connected client, for logging.
+        :param sendspin_client: The client whose hello is awaited.
+        """
+        for _ in range(50):  # Wait up to 5 seconds
+            if sendspin_client.info_or_none is not None:
+                return True
+            await asyncio.sleep(0.1)
+        self.logger.warning("Client %s hello not received within timeout", client_id)
+        return False
+
+    async def _auto_trust_guest_access(
+        self, client_id: str, sendspin_client: SendspinClient, event_version: int
+    ) -> None:
+        """
+        Approve a device that offers guest access, so it plays without any setup step.
+
+        Guest access only ever carries playback and the device stays free to withdraw it,
+        so there is nothing for the user to decide. A device whose every role needs pairing
+        (a capture-only one) gains nothing and is left to pair instead.
+
+        :param client_id: The connected client to approve.
+        :param sendspin_client: That client, for its hello and negotiated roles.
+        :param event_version: The client event this runs for, re-checked before writing.
+        """
+        info = sendspin_client.info_or_none
+        if info is None or not info.unpaired_access.enabled:
+            return
+        # A live long-term handshake is the only proof of a pairing: a record can outlive the
+        # client's own half, and that device reconnects as a guest needing approval again.
+        security = sendspin_client.connection_security
+        if security is not None and security.psk_category is PskCategory.LONG_TERM:
+            return
+        if all(role_requires_pairing(role_id) for role_id in sendspin_client.negotiated_role_ids):
+            return
+        if await self.server_api.pairing_store.trusted_unpaired(client_id) is not None:
+            return
+        if not self._is_current_client_event(client_id, event_version):
+            # the store reads above suspended; the hello this decision rests on may be gone
+            self.logger.debug("Skipping stale guest approval for %s", client_id)
+            return
+        self.logger.debug("Approving guest access for %s", client_id)
+        await self.server_api.trust_unpaired(client_id)
 
     async def _handle_client_removed(self, client_id: str, event_version: int) -> None:
         """Handle a client disconnection asynchronously."""
@@ -1654,6 +1715,7 @@ class SendspinProvider(PlayerProvider):
             previous_device_info = existing_player.device_info
             previous_type = existing_player.type
             existing_player._refresh_client_info(sendspin_client)
+            await self._auto_trust_guest_access(client_id, sendspin_client, event_version)
             if isinstance(existing_player, SendspinPlayer):
                 existing_player.restore_bridge_identity(previous_device_info, previous_type)
             await self._apply_hass_esphome_enrichment([existing_player])
@@ -1740,28 +1802,13 @@ class SendspinProvider(PlayerProvider):
 
         :param player_id: Virtual player to remove.
         """
-        last_error: Exception | None = None
-        for delay in VIRTUAL_PLAYER_CLEANUP_DELAYS:
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                # another teardown won the race; a config it left behind is not ours
-                # to delete - it is kept for the owner to reclaim, and swept at
-                # startup once that owner is gone
-                if not self.is_virtual_player(player_id):
-                    return
-                # awaited to completion on purpose: a timeout is no reliable bound on
-                # the teardown - parts of it swallow the cancellation (see
-                # AsyncProcess.close), and one that does land leaves the player
-                # half torn down for the next attempt to trip over
-                await self.remove_virtual_player(player_id)
-                return
-            except Exception as err:
-                last_error = err
-        self.logger.warning(
-            "Could not clean up failed virtual player creation %s: %s",
+        await cleanup_virtual_player(
             player_id,
-            last_error,
+            VIRTUAL_PLAYER_CLEANUP_DELAYS,
+            self.is_virtual_player,
+            self.remove_virtual_player,
+            self.logger,
+            "Could not clean up failed virtual player creation %s: %s",
         )
 
     def _on_virtual_player_stream_start(self, _request: ExternalStreamStartRequest) -> None:
