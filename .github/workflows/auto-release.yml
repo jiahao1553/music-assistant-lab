@@ -5,9 +5,9 @@ name: Auto Release
 # - Beta, RC, stable: manually triggered
 
 on:
-  schedule:
-    - cron: "0 5 * * *"
-      timezone: "Europe/Amsterdam"
+  # schedule:
+  #   - cron: "0 5 * * *"
+  #     timezone: "Europe/Amsterdam"
   workflow_dispatch:
     inputs:
       channel:
