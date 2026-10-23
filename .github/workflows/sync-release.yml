@@ -1,8 +1,7 @@
 name: Sync upstream release
 
-# Once a month, merge the latest music-assistant/server release into main.
-# The add-on version is updated only on feat/ytmusic_dlp, then a pull request
-# into main is opened. Merging that pull request publishes the image.
+# Once a month, set the Home Assistant add-on version on feat/ytmusic_dlp to the
+# latest music-assistant/server release and open a pull request. main is not changed.
 
 on:
   schedule:
@@ -21,12 +20,12 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: main
+          ref: feat/ytmusic_dlp
           fetch-depth: 0
 
-      - name: Sync release into main, set version on feat/ytmusic_dlp, open pull request
+      - name: Set add-on version and open pull request
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -38,42 +37,10 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/music-assistant-lab:${tag}"
           echo "Upstream release ${tag}"
 
-          git remote add upstream https://github.com/music-assistant/server.git
-          git fetch upstream "refs/tags/${tag}:refs/tags/${tag}"
-          git fetch origin main
           git fetch origin feat/ytmusic_dlp
-          git checkout -B main origin/main
-
-          if git merge-base --is-ancestor "$tag" HEAD; then
-            echo "main already contains upstream ${tag}."
-          else
-            set +e
-            git merge "$tag" --no-edit
-            merge_status=$?
-            set -e
-            if [ "$merge_status" -ne 0 ]; then
-              echo "Conflicted files:"
-              git diff --name-only --diff-filter=U
-              if git diff --name-only --diff-filter=U | grep -qx 'requirements_all.txt'; then
-                git checkout --ours -- requirements_all.txt
-                git add requirements_all.txt
-              fi
-              if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
-                echo "Conflicts remain outside requirements_all.txt."
-                exit 1
-              fi
-              git commit -m "Merge upstream release ${tag}"
-            fi
-
-            python3 scripts/gen_requirements_all.py
-            git add requirements_all.txt
-            if ! git diff --cached --quiet; then
-              git commit -m "Regenerate requirements_all.txt from provider manifests"
-            fi
-            git push origin HEAD:main
-          fi
-
+          git fetch origin main
           git checkout -B feat/ytmusic_dlp origin/feat/ytmusic_dlp
+
           python3 - music_assistant_lab/config.yaml "$tag" "$image" <<'PY'
           import sys
           from pathlib import Path
@@ -97,7 +64,6 @@ jobs:
             git push origin HEAD:feat/ytmusic_dlp
           fi
 
-          git fetch origin main
           if git merge-base --is-ancestor HEAD origin/main; then
             echo "feat/ytmusic_dlp is already contained in main."
             exit 0
@@ -111,12 +77,12 @@ jobs:
 
           body_file=$(mktemp)
           cat > "$body_file" <<EOF
-          Merges \`feat/ytmusic_dlp\` into \`main\`.
+          Updates the add-on version on \`feat/ytmusic_dlp\` to music-assistant/server \`${tag}\`.
 
-          \`main\` is synced to music-assistant/server \`${tag}\`. The add-on version on \`feat/ytmusic_dlp\` is \`${tag}\`. Merging this pull request publishes \`ghcr.io/${GITHUB_REPOSITORY_OWNER}/music-assistant-lab:${tag}\`.
+          This workflow does not change \`main\`. Sync \`main\` yourself, then close this pull request.
           EOF
           gh pr create \
             --base main \
             --head feat/ytmusic_dlp \
-            --title "Merge feat/ytmusic_dlp for upstream ${tag}" \
+            --title "Set add-on version to upstream ${tag}" \
             --body-file "$body_file"
