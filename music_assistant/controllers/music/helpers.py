@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import fields, replace
 from typing import TYPE_CHECKING, Any, Final
 
-from music_assistant_models.enums import ExternalID
+from music_assistant_models.enums import ExternalID, ImageType
 from music_assistant_models.errors import InvalidProviderID, InvalidProviderURI
-from music_assistant_models.helpers import create_safe_string
+from music_assistant_models.helpers import create_safe_string, get_global_cache_value
 from music_assistant_models.media_items import (
     Artist,
     ItemMapping,
@@ -17,6 +17,7 @@ from music_assistant_models.media_items import (
     SearchResults,
     Track,
 )
+from music_assistant_models.media_items.metadata import LifeSpan
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.helpers.external_ids import is_valid_isrc
@@ -148,7 +149,28 @@ def metadata_for_update(
     """
     if overwrite and any(getattr(update, field.name) for field in fields(update)):
         return update
-    return stored.update(update)
+    return merge_metadata(stored, update)
+
+
+def merge_metadata(stored: MediaItemMetadata, update: MediaItemMetadata) -> MediaItemMetadata:
+    """
+    Merge new metadata into the stored metadata (in-place), only filling in what is missing.
+
+    Unlike ``MediaItemMetadata.update`` alone, a partially known life span (e.g. only a birth
+    date from a local NFO file) is completed with the missing dates from the new values.
+
+    :param stored: Metadata to update in-place.
+    :param update: New metadata values.
+    """
+    cur_span, new_span = stored.life_span, update.life_span
+    stored.update(update)
+    if cur_span and new_span:
+        stored.life_span = LifeSpan(
+            begin=cur_span.begin or new_span.begin,
+            end=cur_span.end or new_span.end,
+            ended=cur_span.ended or new_span.ended,
+        )
+    return stored
 
 
 def provider_mappings_for_update(
@@ -172,6 +194,36 @@ def provider_mappings_for_update(
         *update,
         *(mapping for mapping in stored if mapping.provider_instance not in updated_instances),
     }
+
+
+def preferred_thumb(
+    images: Iterable[dict[str, Any]] | None, hidden_sources: AbstractSet[str]
+) -> dict[str, Any] | None:
+    """
+    Return the thumb to show of a library item's stored (raw) images.
+
+    A library item can carry the artwork of several music sources, not all of which the
+    viewer can be shown. The first thumb that can be shown is preferred, falling back to
+    the first thumb.
+
+    :param images: The stored (raw) images of the item.
+    :param hidden_sources: Music sources hidden from the viewer.
+    """
+    thumbs = [image for image in images or () if image["type"] == ImageType.THUMB.value]
+    # same semantics as the MediaItem.available property: an empty cache means unknown
+    available_providers: AbstractSet[str] = get_global_cache_value("available_providers") or set()
+    return next(
+        (
+            image
+            for image in thumbs
+            if image.get("remotely_accessible")
+            or (
+                image["provider"] not in hidden_sources
+                and (not available_providers or image["provider"] in available_providers)
+            )
+        ),
+        thumbs[0] if thumbs else None,
+    )
 
 
 def sibling_instance_mappings(

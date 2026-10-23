@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import pytest
 from music_assistant_models.auth import User, UserRole
-from music_assistant_models.enums import AlbumType, ArtistType, MediaType
+from music_assistant_models.enums import AlbumType, ArtistType, MediaType, SortDirection, SortField
 from music_assistant_models.helpers import create_safe_string
 from music_assistant_models.media_items import (
     Album,
@@ -38,9 +38,10 @@ from music_assistant.constants import (
     DB_TABLE_ALBUM_TRACKS,
     DB_TABLE_FAVORITES,
     DB_TABLE_GENRE_MEDIA_ITEM_MAPPING,
-    DB_TABLE_PLAYLOG,
+    DB_TABLE_MEDIA_PROGRESS,
     DB_TABLE_PROVIDER_MAPPINGS,
 )
+from music_assistant.controllers.music.constants import LEGACY_SORT_KEYS
 from music_assistant.controllers.music.media.base import MediaControllerBase
 from music_assistant.mass import MusicAssistant
 
@@ -311,11 +312,15 @@ async def _compare(
     legacy_rows = await mass.music.database.get_rows_from_query(
         legacy_sql, legacy_params, limit=limit, offset=offset
     )
-    order_by = filter_kwargs.pop("order_by", "sort_name")
+    sort_field, sort_direction = LEGACY_SORT_KEYS[filter_kwargs.pop("order_by", "sort_name")]
     # a favorite belongs to a user, so the listing runs as the one that holds the seeded ones
     with patch(GET_CURRENT_USER, return_value=LISTING_USER):
         new_items = await controller.get_library_items_by_query(
-            order_by=order_by, limit=limit, offset=offset, **filter_kwargs
+            sort_field=sort_field,
+            sort_direction=sort_direction,
+            limit=limit,
+            offset=offset,
+            **filter_kwargs,
         )
     assert [str(row["item_id"]) for row in legacy_rows] == [x.item_id for x in new_items]
     # provider mappings must be hydrated identically
@@ -432,7 +437,7 @@ async def test_track_listing_artist_join_matches_legacy(seeded_mass: MusicAssist
     legacy_params["search_artist"] = "%artist02%"
     legacy_rows = await seeded_mass.music.database.get_rows_from_query(legacy_sql, legacy_params)
     new_items = await seeded_mass.music.tracks.get_library_items_by_query(
-        order_by="sort_name",
+        sort_field=SortField.SORT_NAME,
         in_library_only=True,
         extra_join_parts=[join],
         extra_query_params={"search_artist": "%artist02%"},
@@ -501,10 +506,43 @@ async def test_hidden_track_excluded_from_library_listing(seeded_mass: MusicAssi
     assert "Track hidden" in {x.name for x in items}
 
 
+@pytest.mark.parametrize("field", [SortField.RANDOM, SortField.RANDOM_PLAY_COUNT])
+@pytest.mark.parametrize("seed", [0, -5, 42])
+async def test_seeded_random_query_pages_keep_one_order(
+    seeded_mass: MusicAssistant, field: SortField, seed: int
+) -> None:
+    """Seeded samples and outer SQL ordering agree across every page."""
+    controller = seeded_mass.music.tracks
+    options: dict[str, Any] = {"sort_field": field, "random_seed": seed, "in_library_only": True}
+    whole = await controller.get_library_items_by_query(limit=0, **options)
+    pages = []
+    for offset in range(0, len(whole), 2):
+        pages.extend(await controller.get_library_items_by_query(limit=2, offset=offset, **options))
+
+    assert [item.item_id for item in pages] == [item.item_id for item in whole]
+    assert len({item.item_id for item in pages}) == len(whole)
+
+
+@pytest.mark.parametrize("controller_name", ["tracks", "albums", "artists"])
+async def test_public_library_random_seed_is_forwarded(
+    seeded_mass: MusicAssistant, controller_name: str
+) -> None:
+    """Public library commands retain the same random ordering while paging."""
+    controller = getattr(seeded_mass.music, controller_name)
+    options = {"sort_field": SortField.RANDOM, "random_seed": 17}
+    whole = await controller.library_items(limit=0, **options)
+    first = await controller.library_items(limit=2, **options)
+    rest = await controller.library_items(limit=500, offset=2, **options)
+    other = await controller.library_items(limit=0, sort_field=SortField.RANDOM, random_seed=41)
+
+    assert [item.item_id for item in first + rest] == [item.item_id for item in whole]
+    assert [item.item_id for item in whole] != [item.item_id for item in other]
+
+
 async def test_random_order_applies_filters(seeded_mass: MusicAssistant) -> None:
     """The random-order subquery applies the provider/in-library filters."""
     items = await seeded_mass.music.tracks.get_library_items_by_query(
-        order_by="random", in_library_only=True, provider_filter=["prov_b_inst"]
+        sort_field=SortField.RANDOM, in_library_only=True, provider_filter=["prov_b_inst"]
     )
     expected = await seeded_mass.music.tracks.get_library_items_by_query(
         in_library_only=True, provider_filter=["prov_b_inst"]
@@ -512,7 +550,10 @@ async def test_random_order_applies_filters(seeded_mass: MusicAssistant) -> None
     assert {x.item_id for x in items} == {x.item_id for x in expected}
 
 
-async def test_random_play_count_selects_and_orders_least_played(mass: MusicAssistant) -> None:
+@pytest.mark.parametrize("seed", [None, 0, 17])
+async def test_random_play_count_selects_and_orders_least_played(
+    mass: MusicAssistant, seed: int | None
+) -> None:
     """random_play_count draws the least-played tracks and returns them least-played first."""
     artist = await mass.music.artists.add_item_to_library(
         Artist(item_id="0", provider="library", name="PC Artist", provider_mappings={_mapping()})
@@ -538,7 +579,9 @@ async def test_random_play_count_selects_and_orders_least_played(mass: MusicAssi
 
     # limit smaller than the library so the candidate subquery, not just the outer sort,
     # has to apply the play-count bias
-    items = await mass.music.tracks.library_items(order_by="random_play_count", limit=5)
+    items = await mass.music.tracks.library_items(
+        order_by="random_play_count", limit=5, random_seed=seed
+    )
     ordered_counts = [play_count_by_id[x.item_id] for x in items]
 
     assert ordered_counts == [0, 1, 2, 3, 4]
@@ -599,7 +642,7 @@ async def test_audiobook_listing_resume_info(seeded_mass: MusicAssistant) -> Non
     # two playlog rows for the same book (e.g. two users/providers)
     for userid, timestamp, seconds_played in (("user-a", 100, 60), ("user-b", 200, 120)):
         await seeded_mass.music.database.insert(
-            DB_TABLE_PLAYLOG,
+            DB_TABLE_MEDIA_PROGRESS,
             {
                 "item_id": db_book.item_id,
                 "provider": "library",
@@ -665,7 +708,8 @@ async def test_audiobook_collections_collapse_and_preserve_order(
 
     items = await controller.get_library_items_by_query(
         in_library_only=True,
-        order_by="name_desc",
+        sort_field=SortField.NAME,
+        sort_direction=SortDirection.DESC,
         collapse_collections=True,
     )
     collections = {item.name: item for item in items if isinstance(item, MediaCollection)}
@@ -676,6 +720,23 @@ async def test_audiobook_collections_collapse_and_preserve_order(
         "Alpha 2",
     ]
 
+    for field in (SortField.RANDOM, SortField.RANDOM_PLAY_COUNT):
+        whole = await controller.library_items(
+            sort_field=field, random_seed=0, collapse_collections=True, limit=0
+        )
+        paged: list[Audiobook | MediaCollection[Audiobook]] = []
+        for offset in range(len(whole)):
+            paged.extend(
+                await controller.library_items(
+                    sort_field=field,
+                    random_seed=0,
+                    collapse_collections=True,
+                    limit=1,
+                    offset=offset,
+                )
+            )
+        assert [item.name for item in paged] == [item.name for item in whole]
+
     with patch.object(
         mass.music.database,
         "get_rows_from_query",
@@ -684,7 +745,8 @@ async def test_audiobook_collections_collapse_and_preserve_order(
         search_results = await controller.get_library_items_by_query(
             search="Series",
             in_library_only=True,
-            order_by="name_desc",
+            sort_field=SortField.NAME,
+            sort_direction=SortDirection.DESC,
             collapse_collections=True,
         )
     assert [item.name for item in search_results] == ["Beta Series", "Alpha Series"]
@@ -693,6 +755,25 @@ async def test_audiobook_collections_collapse_and_preserve_order(
     collection = await controller.get_collection(collections["Alpha Series"].item_id)
     assert [item.name for item in collection.items] == ["Alpha 1", "Alpha 1.5", "Alpha 2"]
     assert all(isinstance(item, Audiobook) for item in collection.items)
+
+    page = await controller.get_collection(
+        collections["Alpha Series"].item_id,
+        search="1",
+        limit=1,
+        offset=1,
+    )
+    assert [item.name for item in page.items] == ["Alpha 1.5"]
+
+    # the favorite filter runs before the page is cut: the liked book is the last one
+    alpha_books = collections["Alpha Series"].items
+    await _like(mass, MediaType.AUDIOBOOK, str(alpha_books[-1].item_id), True)
+    with patch(GET_CURRENT_USER, return_value=LISTING_USER):
+        favorites = await controller.get_collection(
+            collections["Alpha Series"].item_id,
+            favorite=True,
+            limit=1,
+        )
+    assert [item.name for item in favorites.items] == ["Alpha 2"]
 
 
 async def test_artist_audiobooks_collapse_collections(
@@ -785,7 +866,7 @@ async def test_listing_queries_stream_from_sort_index(seeded_mass: MusicAssistan
 
             with patch.object(database, "get_rows_from_query", spy):
                 await controller.get_library_items_by_query(
-                    order_by="sort_name", in_library_only=True
+                    sort_field=SortField.SORT_NAME, in_library_only=True
                 )
             plan_rows = await database.get_rows_from_query(
                 f"EXPLAIN QUERY PLAN {captured['query']} LIMIT 500 OFFSET 0",

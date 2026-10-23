@@ -38,7 +38,10 @@ from music_assistant.helpers.util import enrich_device_mac_address
 from music_assistant.models.player import DeviceInfo, LinkedOutputProtocol, Player
 from music_assistant.models.player_provider import PlayerProvider
 from music_assistant.providers.universal_player.constants import CONF_CREATED_AT
-from music_assistant.providers.universal_player.player import UniversalPlayer
+from music_assistant.providers.universal_player.player import (
+    UniversalPlayer,
+    get_clean_player_name,
+)
 from music_assistant.providers.universal_player.provider import UniversalPlayerProvider
 
 
@@ -564,6 +567,36 @@ class TestIdentifiersMatch:
 
         assert controller._identifiers_match(player_a, player_b) is False
 
+    def test_airplay_id_mismatch_blocks_ip_fallback(self, mock_mass: MagicMock) -> None:
+        """Test that AirPlay receivers sharing one IP with LA MACs don't match."""
+        controller = PlayerController(mock_mass)
+
+        provider = MockProvider("airplay")
+        player_a = MockPlayer(
+            provider,
+            "ap02a82cf96025",
+            "Receiver A",
+            player_type=PlayerType.PROTOCOL,
+            identifiers={
+                IdentifierType.MAC_ADDRESS: "02:A8:2C:F9:60:25",
+                IdentifierType.IP_ADDRESS: "192.168.1.117",
+                IdentifierType.AIRPLAY_ID: "ap02a82cf96025",
+            },
+        )
+        player_b = MockPlayer(
+            provider,
+            "ap5ab35862ec6c",
+            "Receiver B",
+            player_type=PlayerType.PROTOCOL,
+            identifiers={
+                IdentifierType.MAC_ADDRESS: "5A:B3:58:62:EC:6C",
+                IdentifierType.IP_ADDRESS: "192.168.1.117",
+                IdentifierType.AIRPLAY_ID: "ap5ab35862ec6c",
+            },
+        )
+
+        assert controller._identifiers_match(player_a, player_b) is False
+
     def test_ip_fallback_with_la_mac(self, mock_mass: MagicMock) -> None:
         """Test IP fallback matching when one player has a locally-administered MAC."""
         controller = PlayerController(mock_mass)
@@ -1036,10 +1069,8 @@ class TestMintPlayerId:
 class TestGetCleanPlayerName:
     """Tests for player name selection."""
 
-    def test_prefers_chromecast_name(self, mock_mass: MagicMock) -> None:
+    def test_prefers_chromecast_name(self) -> None:
         """Test that Chromecast names are preferred over other protocols."""
-        universal_provider = create_mock_universal_provider(mock_mass)
-
         airplay_provider = MockProvider("airplay")
         chromecast_provider = MockProvider("chromecast")
 
@@ -1057,13 +1088,11 @@ class TestGetCleanPlayerName:
         )
 
         # Chromecast should be preferred (priority 1)
-        clean_name = universal_provider._get_clean_player_name([airplay_player, chromecast_player])
+        clean_name = get_clean_player_name([airplay_player, chromecast_player])
         assert clean_name == "Living Room Speaker"
 
-    def test_filters_mac_address_names(self, mock_mass: MagicMock) -> None:
+    def test_filters_mac_address_names(self) -> None:
         """Test that MAC address-like names are filtered out."""
-        universal_provider = create_mock_universal_provider(mock_mass)
-
         squeezelite_provider = MockProvider("squeezelite")
         airplay_provider = MockProvider("airplay")
 
@@ -1083,13 +1112,11 @@ class TestGetCleanPlayerName:
         )
 
         # Should prefer Kitchen Speaker over MAC address
-        clean_name = universal_provider._get_clean_player_name([sq_player, ap_player])
+        clean_name = get_clean_player_name([sq_player, ap_player])
         assert clean_name == "Kitchen Speaker"
 
-    def test_filters_player_id_names(self, mock_mass: MagicMock) -> None:
+    def test_filters_player_id_names(self) -> None:
         """Test that player ID-like names are filtered out."""
-        universal_provider = create_mock_universal_provider(mock_mass)
-
         sendspin_provider = MockProvider("sendspin")
         dlna_provider = MockProvider("dlna")
 
@@ -1109,13 +1136,11 @@ class TestGetCleanPlayerName:
         )
 
         # Should prefer Bedroom TV over player ID
-        clean_name = universal_provider._get_clean_player_name([ss_player, dlna_player])
+        clean_name = get_clean_player_name([ss_player, dlna_player])
         assert clean_name == "Bedroom TV"
 
-    def test_valid_name_unchanged(self, mock_mass: MagicMock) -> None:
+    def test_valid_name_unchanged(self) -> None:
         """Test that valid names are returned unchanged."""
-        universal_provider = create_mock_universal_provider(mock_mass)
-
         provider = MockProvider("airplay")
         player = MockPlayer(
             provider,
@@ -1124,8 +1149,20 @@ class TestGetCleanPlayerName:
             player_type=PlayerType.PLAYER,
         )
 
-        clean_name = universal_provider._get_clean_player_name([player])
+        clean_name = get_clean_player_name([player])
         assert clean_name == "HomePod Mini"
+
+    def test_no_name_without_a_usable_one(self) -> None:
+        """Test that no name is returned when every name looks like a technical id."""
+        provider = MockProvider("squeezelite")
+        player = MockPlayer(
+            provider,
+            "sq_123456",
+            "AA:BB:CC:DD:EE:FF",
+            player_type=PlayerType.PROTOCOL,
+        )
+
+        assert get_clean_player_name([player]) is None
 
 
 class TestCachedProtocolParentRestore:
@@ -2764,6 +2801,7 @@ class TestSessionBoundNativeGrouping:
         mock_mass: MagicMock,
         parent_class: type[MockPlayer],
         with_orphan: bool = False,
+        with_airplay: bool = False,
     ) -> tuple[PlayerController, dict[str, MockPlayer]]:
         """
         Build a leader with a natively groupable member and a bridge-only member.
@@ -2775,6 +2813,7 @@ class TestSessionBoundNativeGrouping:
         :param mock_mass: The mocked MusicAssistant instance.
         :param parent_class: The player class to build the leader from.
         :param with_orphan: Add a second natively groupable member without a bridge protocol.
+        :param with_airplay: Also link an AirPlay protocol player to the leader and its member.
         """
         controller = PlayerController(mock_mass)
         speaker_provider = MockProvider("speaker", instance_id="speaker_instance", mass=mock_mass)
@@ -2829,6 +2868,29 @@ class TestSessionBoundNativeGrouping:
             orphan._attr_supported_features.add(PlayerFeature.PLAY_MEDIA)
             orphan._cache.clear()
             players["speaker_orphan"] = orphan
+        if with_airplay:
+            airplay_provider = MockProvider(
+                "airplay", instance_id="airplay_instance", mass=mock_mass
+            )
+            for parent, airplay_id, airplay_name in (
+                (leader, "airplay_leader", "Living Room (AirPlay)"),
+                (member, "airplay_member", "Kitchen (AirPlay)"),
+            ):
+                airplay = MockPlayer(
+                    airplay_provider, airplay_id, airplay_name, player_type=PlayerType.PROTOCOL
+                )
+                airplay._attr_supported_features.add(PlayerFeature.SET_MEMBERS)
+                airplay._cache.clear()
+                airplay.set_protocol_parent_id(parent.player_id)
+                parent.set_linked_output_protocols(
+                    [
+                        *parent.linked_output_protocols,
+                        LinkedOutputProtocol(
+                            output_protocol_id=airplay_id, protocol_domain="airplay", priority=10
+                        ),
+                    ]
+                )
+                players[airplay_id] = airplay
 
         mock_mass.players = controller
         controller._players = dict(players)
@@ -2901,6 +2963,167 @@ class TestSessionBoundNativeGrouping:
         assert native_members == ["speaker_member"]
         assert protocol_members == ["bridge_only"]
         assert protocol_domain == "sendspin"
+
+
+class TestRegroupOffUnneededProtocol:
+    """
+    A group that was moved onto a bridge protocol for one member leaves it once that member left.
+
+    The regrouping only happens on a fresh playback start, so running playback is never
+    interrupted.
+    """
+
+    async def _build_left_on_bridge(
+        self, mock_mass: MagicMock, with_airplay: bool = False
+    ) -> tuple[PlayerController, dict[str, MockPlayer]]:
+        """
+        Build two session-bound speakers left grouped on the bridge after the bridge-only member left.
+
+        The bridge-only member joins the native group (moving it onto the bridge) and leaves it
+        again, exactly as the grouping commands do it.
+        """
+        controller, players = TestSessionBoundNativeGrouping()._build_topology(
+            mock_mass, SessionBoundMockPlayer, with_airplay=with_airplay
+        )
+        leader = players["speaker_leader"]
+        for player in players.values():
+            self._update_state_on_set_members(player)
+            player.play_media = AsyncMock()  # type: ignore[method-assign]
+        await leader.set_members(player_ids_to_add=["speaker_member"])
+        leader.set_active_output_protocol("native")
+
+        await controller._handle_set_members_with_protocols(leader, ["bridge_only"], [])
+        await controller._handle_set_members_with_protocols(leader, [], ["bridge_only"])
+
+        assert players["bridge_leader"].group_members == ["bridge_leader", "bridge_member"]
+        assert "speaker_member" not in leader.group_members
+        return controller, players
+
+    @staticmethod
+    def _update_state_on_set_members(player: MockPlayer) -> None:
+        """Recalculate the player's state after each member change, as a real provider does."""
+        set_members = player.set_members
+
+        async def _set_members(
+            player_ids_to_add: list[str] | None = None,
+            player_ids_to_remove: list[str] | None = None,
+        ) -> None:
+            await set_members(player_ids_to_add, player_ids_to_remove)
+            player.update_state(signal_event=False)
+
+        player.set_members = _set_members  # type: ignore[method-assign]
+
+    @pytest.mark.parametrize("active_protocol", ["bridge_leader", None])
+    async def test_fresh_start_regroups_natively(
+        self, mock_mass: MagicMock, active_protocol: str | None
+    ) -> None:
+        """
+        The remaining speakers are grouped natively again and the group plays natively.
+
+        The leader's active protocol may still point at the bridge, or already be cleared
+        once it went idle.
+        """
+        controller, players = await self._build_left_on_bridge(mock_mass)
+        leader = players["speaker_leader"]
+        leader.set_active_output_protocol(active_protocol)
+        media = PlayerMedia(uri="http://test/stream")
+
+        await controller._handle_play_media("speaker_leader", media)
+
+        assert players["bridge_leader"].group_members == ["bridge_leader"]
+        assert leader.group_members == ["speaker_leader", "speaker_member"]
+        assert players["speaker_member"].active_output_protocol is None
+        assert leader.active_output_protocol == "native"
+        leader.play_media.assert_awaited_once_with(media)  # type: ignore[attr-defined]
+        players["bridge_leader"].play_media.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_group_that_still_needs_the_bridge_is_left_alone(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """A member that can only be reached through the bridge keeps the group on it."""
+        controller, players = await self._build_left_on_bridge(mock_mass)
+        leader = players["speaker_leader"]
+        await controller._handle_set_members_with_protocols(leader, ["bridge_only"], [])
+        bridge_members = list(players["bridge_leader"].group_members)
+        bridge_set_members = AsyncMock(wraps=players["bridge_leader"].set_members)
+        players["bridge_leader"].set_members = bridge_set_members  # type: ignore[method-assign]
+        media = PlayerMedia(uri="http://test/stream")
+
+        await controller._handle_play_media("speaker_leader", media)
+
+        bridge_set_members.assert_not_awaited()
+        assert players["bridge_leader"].group_members == bridge_members
+        assert set(bridge_members) == {"bridge_leader", "bridge_member", "bridge_only"}
+        assert "speaker_member" not in leader.group_members
+        players["bridge_leader"].play_media.assert_awaited_once_with(media)  # type: ignore[attr-defined]
+        leader.play_media.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_leader_that_prefers_the_bridge_keeps_its_group(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """A leader that plays through its preferred bridge keeps its members on that bridge."""
+        controller, players = await self._build_left_on_bridge(mock_mass)
+        mock_mass.config.get_raw_player_config_value = MagicMock(
+            side_effect=lambda player_id, key, default=None: (
+                "bridge_leader"
+                if key == CONF_PREFERRED_OUTPUT_PROTOCOL and player_id == "speaker_leader"
+                else default
+            )
+        )
+        media = PlayerMedia(uri="http://test/stream")
+
+        await controller._handle_play_media("speaker_leader", media)
+
+        assert players["bridge_leader"].group_members == ["bridge_leader", "bridge_member"]
+        players["bridge_leader"].play_media.assert_awaited_once_with(media)  # type: ignore[attr-defined]
+
+    async def test_group_that_prefers_another_protocol_regroups_onto_it(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """
+        Speakers that all prefer another protocol are regrouped onto that protocol.
+
+        The leader plays through its preferred protocol, so its members can follow it there.
+        """
+        controller, players = await self._build_left_on_bridge(mock_mass, with_airplay=True)
+        preferred = {"speaker_leader": "airplay_leader", "speaker_member": "airplay_member"}
+        mock_mass.config.get_raw_player_config_value = MagicMock(
+            side_effect=lambda player_id, key, default=None: (
+                preferred.get(player_id, default)
+                if key == CONF_PREFERRED_OUTPUT_PROTOCOL
+                else default
+            )
+        )
+        media = PlayerMedia(uri="http://test/stream")
+
+        await controller._handle_play_media("speaker_leader", media)
+
+        assert players["bridge_leader"].group_members == ["bridge_leader"]
+        assert players["airplay_leader"].group_members == ["airplay_leader", "airplay_member"]
+        assert players["speaker_leader"].active_output_protocol == "airplay_leader"
+        players["airplay_leader"].play_media.assert_awaited_once_with(media)  # type: ignore[attr-defined]
+        players["bridge_leader"].play_media.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize("playback_state", [PlaybackState.PLAYING, PlaybackState.PAUSED])
+    async def test_running_playback_is_not_interrupted(
+        self, mock_mass: MagicMock, playback_state: PlaybackState
+    ) -> None:
+        """A group that is playing (or paused) keeps playing through the bridge."""
+        controller, players = await self._build_left_on_bridge(mock_mass)
+        leader = players["speaker_leader"]
+        # the bridge renders the group, so the leader reports its playback state
+        players["bridge_leader"]._attr_playback_state = playback_state
+        players["bridge_leader"].update_state(signal_event=False)
+        leader.refresh_state(signal_event=False)
+        assert leader.state.playback_state == playback_state
+        media = PlayerMedia(uri="http://test/stream")
+
+        await controller._handle_play_media("speaker_leader", media)
+
+        assert players["bridge_leader"].group_members == ["bridge_leader", "bridge_member"]
+        assert "speaker_member" not in leader.group_members
+        players["bridge_leader"].play_media.assert_awaited_once_with(media)  # type: ignore[attr-defined]
+        leader.play_media.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 class TestCanGroupWith:
@@ -5015,6 +5238,70 @@ class TestProtocolToUniversalIdentifierFallback:
 
         # Should NOT be linked to the wrong universal player
         assert sendspin_player.protocol_parent_id != "up_aabbccddeeff"
+
+    @pytest.mark.parametrize(
+        ("mac_1", "mac_2"),
+        [
+            ("02:A8:2C:F9:60:25", "5A:B3:58:62:EC:6C"),
+            # ARP resolved both receivers to the shared host MAC
+            ("B8:27:EB:12:34:56", "B8:27:EB:12:34:56"),
+        ],
+    )
+    def test_airplay_receivers_on_shared_ip_keep_own_universal(
+        self, mock_mass: MagicMock, mac_1: str, mac_2: str
+    ) -> None:
+        """Test that a re-registered AirPlay receiver doesn't take a sibling receiver's parent."""
+        controller = PlayerController(mock_mass)
+
+        def mock_config_get(_key: str, default: str | None = None) -> str | None:
+            return default
+
+        mock_mass.config.get.side_effect = mock_config_get
+
+        def receiver_ids(airplay_id: str, mac: str) -> dict[IdentifierType, str]:
+            return {
+                IdentifierType.MAC_ADDRESS: mac,
+                IdentifierType.IP_ADDRESS: "192.168.1.117",
+                IdentifierType.AIRPLAY_ID: airplay_id,
+            }
+
+        # Receiver 1 is currently unregistered, so its universal player has a free AirPlay slot
+        universal_1 = _create_universal_player(
+            mock_mass,
+            "up_receiver1",
+            "Receiver 1",
+            protocol_player_ids=["ap02a82cf96025"],
+            identifiers=receiver_ids("ap02a82cf96025", mac_1),
+        )
+        universal_2 = _create_universal_player(
+            mock_mass,
+            "up_receiver2",
+            "Receiver 2",
+            protocol_player_ids=["ap5ab35862ec6c"],
+            identifiers=receiver_ids("ap5ab35862ec6c", mac_2),
+        )
+
+        airplay_provider = MockProvider("airplay", mass=mock_mass)
+        receiver_2 = MockPlayer(
+            airplay_provider,
+            "ap5ab35862ec6c",
+            "Receiver 2",
+            player_type=PlayerType.PROTOCOL,
+            identifiers=receiver_ids("ap5ab35862ec6c", mac_2),
+        )
+
+        mock_mass.players = controller
+        controller._players = {
+            "up_receiver1": universal_1,
+            "up_receiver2": universal_2,
+            "ap5ab35862ec6c": receiver_2,
+        }
+        receiver_2.set_initialized()
+
+        controller._try_link_protocol_to_native(receiver_2)
+
+        assert receiver_2.protocol_parent_id == "up_receiver2"
+        assert "ap5ab35862ec6c" not in universal_1._protocol_player_ids
 
     def test_known_protocol_id_still_works(self, mock_mass: MagicMock) -> None:
         """Test that the existing path (player_id in _protocol_player_ids) still works."""
@@ -9379,7 +9666,7 @@ class TestNativePlayerSiblingLinking:
         # AirPlay has cached parent set but parent hasn't registered yet
         ap_player.set_protocol_parent_id("2140037800")
 
-        # Sendspin (registered, not linked)
+        # Sendspin, registered but not linked
         spb_provider = MockProvider("sendspin", mass=mock_mass)
         spb_player = MockPlayer(
             spb_provider,
