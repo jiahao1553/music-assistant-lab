@@ -1,5 +1,5 @@
 name: Music Assistant Lab
-version: 0.0.0
+version: 2.10.7
 slug: music_assistant_lab
 description: Music Assistant server built from the music-assistant-lab fork
 url: https://github.com/jiahao1553/music-assistant-lab
@@ -20,7 +20,7 @@ panel_icon: mdi:music-assistant
 panel_title: Music Assistant
 panel_admin: false
 init: false
-image: ghcr.io/jiahao1553/music-assistant-lab:latest
+image: ghcr.io/jiahao1553/music-assistant-lab:2.10.7
 tmpfs: true
 backup_exclude:
   - cache.db
