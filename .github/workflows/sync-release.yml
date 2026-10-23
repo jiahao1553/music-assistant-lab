@@ -34,7 +34,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           tag=$(gh release view --repo music-assistant/server --json tagName --jq .tagName)
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/music-assistant-lab:${tag}"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/music-assistant-lab"
           echo "Upstream release ${tag}"
 
           git fetch origin feat/ytmusic_dlp

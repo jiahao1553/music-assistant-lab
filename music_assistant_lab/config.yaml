@@ -20,7 +20,7 @@ panel_icon: mdi:music-assistant
 panel_title: Music Assistant
 panel_admin: false
 init: false
-image: ghcr.io/jiahao1553/music-assistant-lab:2.10.7
+image: ghcr.io/jiahao1553/music-assistant-lab
 tmpfs: true
 backup_exclude:
   - cache.db
