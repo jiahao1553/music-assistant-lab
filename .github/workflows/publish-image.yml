@@ -3,12 +3,12 @@ name: Publish image
 on:
   push:
     branches:
-      - feat/ytmusic_dlp
       - main
     paths:
       - .github/workflows/publish-image.yml
       - Dockerfile
       - music_assistant/**
+      - music_assistant_lab/config.yaml
       - pyproject.toml
       - requirements_all.txt
   workflow_dispatch:
@@ -57,6 +57,22 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
 
+      - name: Read add-on version
+        id: addon
+        run: |
+          version=$(python - <<'PY'
+          from pathlib import Path
+          for line in Path("music_assistant_lab/config.yaml").read_text().splitlines():
+              if line.startswith("version:"):
+                  print(line.split(":", 1)[1].strip().strip("'\""))
+                  break
+          else:
+              raise SystemExit("music_assistant_lab/config.yaml has no version")
+          PY
+          )
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${{ github.repository_owner }}/music-assistant-lab:${version}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -68,8 +84,10 @@ jobs:
           build-args: |
             MASS_VERSION=${{ steps.wheel.outputs.version }}
           tags: |
+            ${{ steps.addon.outputs.image }}
             ghcr.io/${{ github.repository_owner }}/music-assistant-lab:latest
             ghcr.io/${{ github.repository_owner }}/music-assistant-lab:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.addon.outputs.version }}
